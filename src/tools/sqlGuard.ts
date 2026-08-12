@@ -231,16 +231,19 @@ function readOnlyRelation(
  * token stream so every relation in a FROM/JOIN list is captured, including
  * comma-joins (`FROM t1, t2`), aliased items (`FROM a x, b`), the `ONLY` forms
  * (`ONLY t`, `ONLY (t)`), `LATERAL` modifiers, relations that follow a join
- * condition (`FROM a JOIN b ON ..., c`), and relations inside parenthesized
- * subqueries (derived tables, WHERE IN (...), CTEs). Function calls and CTE
- * names come back too; the allowlist check resolves each reference against the
- * catalog and only enforces on identifiers that are real relations.
+ * condition (`FROM a JOIN b ON ..., c`), parenthesized join groups
+ * (`FROM (a JOIN b ON ...)`), and relations inside parenthesized subqueries
+ * (derived tables, WHERE IN (...), CTEs). When `inFromClause` is set, the scan
+ * starts expecting a from-item, so the first relation inside a parenthesized
+ * group is not skipped. Function calls and CTE names come back too; the
+ * allowlist check resolves each reference against the catalog and only enforces
+ * on identifiers that are real relations.
  */
-export function extractTableReferences(clean: string): string[] {
+export function extractTableReferences(clean: string, inFromClause = false): string[] {
   const refs: string[] = [];
   let i = 0;
-  let expectRelation = false;
-  let inFromClause = false;
+  let expectRelation = inFromClause;
+  let inFrom = inFromClause;
 
   while (i < clean.length) {
     const ch = clean[i];
@@ -254,14 +257,19 @@ export function extractTableReferences(clean: string): string[] {
         i++;
         continue;
       }
-      refs.push(...extractTableReferences(clean.slice(i + 1, end)));
+      refs.push(
+        ...extractTableReferences(
+          clean.slice(i + 1, end),
+          expectRelation || inFrom,
+        ),
+      );
       i = end + 1;
       expectRelation = false;
       continue;
     }
     if (ch === ",") {
       i++;
-      if (inFromClause && !expectRelation) expectRelation = true;
+      if (inFrom && !expectRelation) expectRelation = true;
       continue;
     }
 
@@ -305,9 +313,9 @@ export function extractTableReferences(clean: string): string[] {
 
     if (CONTEXT_KEYWORDS.has(upper)) {
       expectRelation = true;
-      inFromClause = true;
+      inFrom = true;
     } else if (CLAUSE_END_KEYWORDS.has(upper)) {
-      inFromClause = false;
+      inFrom = false;
     }
     i = word.end;
   }

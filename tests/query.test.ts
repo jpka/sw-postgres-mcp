@@ -382,6 +382,22 @@ describe("query tool", () => {
     });
   });
 
+  it("parenthesized join groups are still allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: "SELECT * FROM (t3q_secret_tokens s JOIN t3q_customers a ON s.id = a.id)", reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+  });
+
   it("refuses a mutating statement with a structured error before hitting the database", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

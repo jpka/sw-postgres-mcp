@@ -154,7 +154,10 @@ function skipWs(sql: string, i: number): number {
 }
 
 /** Read an identifier (quoted or unquoted). Returns null when `start` is not one. */
-function readWord(sql: string, start: number): { value: string; end: number } | null {
+function readWord(
+  sql: string,
+  start: number,
+): { value: string; end: number; raw: string } | null {
   const ch = sql[start];
   if (ch === '"') {
     let i = start + 1;
@@ -166,16 +169,16 @@ function readWord(sql: string, start: number): { value: string; end: number } | 
           i += 2;
           continue;
         }
-        return { value: out, end: i + 1 };
+        return { value: out, end: i + 1, raw: sql.slice(start, i + 1) };
       }
       out += sql[i];
       i++;
     }
-    return { value: out, end: sql.length };
+    return { value: out, end: sql.length, raw: sql.slice(start) };
   }
   const m = /^[A-Za-z_][A-Za-z0-9_$]*/.exec(sql.slice(start));
   if (!m) return null;
-  return { value: m[0], end: start + m[0].length };
+  return { value: m[0], end: start + m[0].length, raw: m[0] };
 }
 
 /** Read a possibly schema-qualified relation starting at `start`. */
@@ -185,12 +188,12 @@ function readRelation(
 ): { ref: string; end: number } | null {
   const first = readWord(sql, start);
   if (!first) return null;
-  const parts = [first.value];
+  const parts = [first.raw];
   let pos = skipWs(sql, first.end);
   if (sql[pos] === ".") {
     const second = readWord(sql, skipWs(sql, pos + 1));
     if (second) {
-      parts.push(second.value);
+      parts.push(second.raw);
       pos = skipWs(sql, second.end);
     }
   }

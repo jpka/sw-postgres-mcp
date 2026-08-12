@@ -398,6 +398,35 @@ describe("query tool", () => {
     });
   });
 
+  it("quoted mixed-case relations are still allowlist-checked", async () => {
+    await withSuperuser(async (c) => {
+      await c.query(`DROP TABLE IF EXISTS "t3q_SecretTokens"`);
+      await c.query(`CREATE TABLE "t3q_SecretTokens" (token TEXT)`);
+      await c.query(`INSERT INTO "t3q_SecretTokens" (token) VALUES ('shh')`);
+      await c.query(`GRANT SELECT ON "t3q_SecretTokens" TO readonly`);
+    });
+
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    try {
+      await expect(
+        runQuery(
+          roPool,
+          { statement: 'SELECT * FROM public."t3q_SecretTokens"', reason: "test" },
+          config,
+        ),
+      ).rejects.toMatchObject({
+        code: "TABLE_NOT_ALLOWLISTED",
+        message: "Table public.t3q_SecretTokens is not in the read allowlist.",
+      });
+    } finally {
+      await withSuperuser(async (c) => {
+        await c.query(`DROP TABLE IF EXISTS "t3q_SecretTokens"`);
+      });
+    }
+  });
+
   it("refuses a mutating statement with a structured error before hitting the database", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

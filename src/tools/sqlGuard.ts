@@ -7,16 +7,16 @@ interface ScanResult {
   /** SQL with comments and string literals replaced by single spaces. */
   clean: string;
   /**
-   * Index in the raw SQL of the first semicolon that is not inside a string or
-   * comment. In a single statement every real semicolon is a trailing
-   * terminator, so cutting at the first one yields the statement body.
+   * Raw index just past the last real token. Real tokens are everything that is
+   * not whitespace, not a comment, and not a `;` terminator — so string
+   * literals count and trailing comments do not.
    */
-  firstRealSemicolon: number;
+  lastRealEnd: number;
 }
 
 function scanStatement(sql: string): ScanResult {
   let out = "";
-  let firstRealSemicolon = -1;
+  let lastRealEnd = 0;
   let i = 0;
   const n = sql.length;
 
@@ -51,6 +51,7 @@ function scanStatement(sql: string): ScanResult {
         }
         i++;
       }
+      lastRealEnd = i;
       out += " ";
       continue;
     }
@@ -61,18 +62,19 @@ function scanStatement(sql: string): ScanResult {
         const end = sql.indexOf(tag[0], i + tag[0].length);
         if (end !== -1) {
           i = end + tag[0].length;
+          lastRealEnd = i;
           out += " ";
           continue;
         }
       }
     }
 
-    if (ch === ";" && firstRealSemicolon === -1) firstRealSemicolon = i;
+    if (ch !== ";") lastRealEnd = i + 1;
     out += ch;
     i++;
   }
 
-  return { clean: out, firstRealSemicolon };
+  return { clean: out, lastRealEnd };
 }
 
 /**
@@ -85,15 +87,14 @@ export function sanitizeSql(sql: string): string {
 }
 
 /**
- * Drop trailing statement terminators (and anything after them) from the raw
- * SQL, so a single statement can be wrapped in a derived table. The last real
- * semicolon is located lexically, so a `;` or `--` inside a string literal is
- * never mistaken for a terminator or comment.
+ * Drop trailing statement terminators and comments from the raw SQL, so a
+ * single statement can be wrapped in a derived table. The cut point is the end
+ * of the last real token (string literals count; comments and `;` do not), so a
+ * `;` or `--` inside a string literal is never mistaken for a terminator.
  */
-export function stripTrailingSemicolons(sql: string): string {
-  const { firstRealSemicolon } = scanStatement(sql);
-  if (firstRealSemicolon === -1) return sql.trimEnd();
-  return sql.slice(0, firstRealSemicolon).trimEnd();
+export function stripTrailingTerminators(sql: string): string {
+  const { lastRealEnd } = scanStatement(sql);
+  return sql.slice(0, lastRealEnd).trimEnd();
 }
 
 /** Throw MULTI_STATEMENT / EMPTY_STATEMENT unless `clean` is exactly one statement. */

@@ -3,7 +3,7 @@ import type { AppConfig } from "../config.js";
 import { ToolFailure, validateReason } from "./errors.js";
 import {
   sanitizeSql,
-  stripTrailingSemicolons,
+  stripTrailingTerminators,
   assertSingleStatement,
   assertReadStatement,
   assertTablesAllowlisted,
@@ -35,9 +35,9 @@ export async function runQuery(
   assertReadStatement(clean);
   await assertTablesAllowlisted(pool, clean, config);
 
-  // Trailing statement terminators would break the derived-table wrapper, so
+  // Trailing terminators or comments would break the derived-table wrapper, so
   // drop them before wrapping (a `;`/`--` inside a string literal is untouched).
-  const base = stripTrailingSemicolons(args.statement);
+  const base = stripTrailingTerminators(args.statement);
 
   // Apply the requested limit by wrapping, so it composes with statements that
   // already carry their own LIMIT and never conflicts with one.

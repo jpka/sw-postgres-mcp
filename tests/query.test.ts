@@ -172,6 +172,42 @@ describe("query tool", () => {
     expect(result.rows[0].marker).toBe("a;b");
   });
 
+  it("trailing line comments are dropped before a limit wrapper", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    const result = await runQuery(
+      roPool,
+      {
+        statement: "SELECT 'x' AS marker -- trailing comment",
+        limit: 1,
+        reason: "test trailing line comment",
+      },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+    expect(result.rows[0].marker).toBe("x");
+  });
+
+  it("trailing block comments are dropped before a limit wrapper", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    const result = await runQuery(
+      roPool,
+      {
+        statement: "SELECT 'y' AS marker /* trailing block */",
+        limit: 1,
+        reason: "test trailing block comment",
+      },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+    expect(result.rows[0].marker).toBe("y");
+  });
+
   it("ONLY table references are still allowlist-checked", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

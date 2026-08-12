@@ -136,6 +136,42 @@ describe("query tool", () => {
     expect(result.row_count).toBe(1);
   });
 
+  it("a string literal containing -- is not stripped as a comment", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    const result = await runQuery(
+      roPool,
+      {
+        statement: "SELECT '--' AS marker",
+        limit: 1,
+        reason: "test literal with comment-looking text",
+      },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+    expect(result.rows[0].marker).toBe("--");
+  });
+
+  it("a string literal containing a semicolon is not mistaken for a terminator", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    const result = await runQuery(
+      roPool,
+      {
+        statement: "SELECT 'a;b' AS marker",
+        limit: 1,
+        reason: "test literal with semicolon",
+      },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+    expect(result.rows[0].marker).toBe("a;b");
+  });
+
   it("ONLY table references are still allowlist-checked", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

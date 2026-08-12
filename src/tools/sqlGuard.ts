@@ -3,13 +3,20 @@ import type { AppConfig } from "../config.js";
 import { isTableReadable } from "../config.js";
 import { ToolFailure } from "./errors.js";
 
-/**
- * Replace comments and string literals with spaces so keyword and identifier
- * scanning below is not fooled by SQL-looking text inside a literal or comment.
- * Preserves token boundaries (each removed span becomes a single space).
- */
-export function sanitizeSql(sql: string): string {
+interface ScanResult {
+  /** SQL with comments and string literals replaced by single spaces. */
+  clean: string;
+  /**
+   * Index in the raw SQL of the first semicolon that is not inside a string or
+   * comment. In a single statement every real semicolon is a trailing
+   * terminator, so cutting at the first one yields the statement body.
+   */
+  firstRealSemicolon: number;
+}
+
+function scanStatement(sql: string): ScanResult {
   let out = "";
+  let firstRealSemicolon = -1;
   let i = 0;
   const n = sql.length;
 
@@ -60,11 +67,33 @@ export function sanitizeSql(sql: string): string {
       }
     }
 
+    if (ch === ";" && firstRealSemicolon === -1) firstRealSemicolon = i;
     out += ch;
     i++;
   }
 
-  return out;
+  return { clean: out, firstRealSemicolon };
+}
+
+/**
+ * Replace comments and string literals with spaces so keyword and identifier
+ * scanning is not fooled by SQL-looking text inside a literal or comment.
+ * Preserves token boundaries (each removed span becomes a single space).
+ */
+export function sanitizeSql(sql: string): string {
+  return scanStatement(sql).clean;
+}
+
+/**
+ * Drop trailing statement terminators (and anything after them) from the raw
+ * SQL, so a single statement can be wrapped in a derived table. The last real
+ * semicolon is located lexically, so a `;` or `--` inside a string literal is
+ * never mistaken for a terminator or comment.
+ */
+export function stripTrailingSemicolons(sql: string): string {
+  const { firstRealSemicolon } = scanStatement(sql);
+  if (firstRealSemicolon === -1) return sql.trimEnd();
+  return sql.slice(0, firstRealSemicolon).trimEnd();
 }
 
 /** Throw MULTI_STATEMENT / EMPTY_STATEMENT unless `clean` is exactly one statement. */

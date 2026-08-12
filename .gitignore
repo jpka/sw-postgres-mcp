@@ -1,2 +1,15 @@
 # Claude Code local settings — contains machine-specific paths
 .claude/
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local config (may contain secrets)
+config.json
+
+# Env
+.env
+.env.local

@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mcp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mcp_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Provision roles
+        run: |
+          # Wait for postgres to be ready (services healthcheck already, but be explicit)
+          for i in {1..20}; do
+            pg_isready -h localhost -p 5432 -U postgres && break
+            sleep 1
+          done
+          psql "postgres://postgres:postgres@localhost:5432/mcp_test" -f docker/init/01-roles.sql
+        env:
+          PGPASSWORD: postgres
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/mcp_test
+          DATABASE_URL_READONLY: postgres://readonly:readonly_password@localhost:5432/mcp_test
+          DATABASE_URL_WRITER: postgres://writer:writer_password@localhost:5432/mcp_test
+
+      - name: Docker compose smoke test
+        run: |
+          docker compose config
+          docker compose up -d --wait
+          psql "postgres://postgres:postgres@localhost:5432/mcp_test" -c "SELECT current_user"
+          docker compose down

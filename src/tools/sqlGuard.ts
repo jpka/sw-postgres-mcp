@@ -57,7 +57,7 @@ function scanStatement(sql: string): ScanResult {
     }
 
     if (ch === "$") {
-      const tag = /^\$[A-Za-z_][A-Za-z0-9_]*\$/.exec(sql.slice(i));
+      const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i));
       if (tag) {
         const end = sql.indexOf(tag[0], i + tag[0].length);
         if (end !== -1) {

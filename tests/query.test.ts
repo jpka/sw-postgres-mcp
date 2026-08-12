@@ -172,6 +172,24 @@ describe("query tool", () => {
     expect(result.rows[0].marker).toBe("a;b");
   });
 
+  it("dollar-quoted literals containing a semicolon are not mistaken for a terminator", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    const result = await runQuery(
+      roPool,
+      {
+        statement: "SELECT $$hello;world$$ AS marker",
+        limit: 1,
+        reason: "test dollar-quoted literal with semicolon",
+      },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+    expect(result.rows[0].marker).toBe("hello;world");
+  });
+
   it("trailing line comments are dropped before a limit wrapper", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

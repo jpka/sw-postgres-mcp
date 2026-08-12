@@ -131,6 +131,45 @@ describe("describe_schema", () => {
     expect(names).not.toContain("public.order_items");
   });
 
+  it("FKs referencing non-allowlisted tables are dropped from output", async () => {
+    const config: AppConfig = {
+      database: {
+        readonlyConnectionString: READONLY_URL,
+        writerConnectionString: READONLY_URL,
+      },
+      allowlist: {
+        read: {
+          tables: ["public.customers"],
+        },
+        write: { schemas: [], tables: [] },
+      },
+    };
+    const tables = await describeSchema(roPool, config);
+    const names = tables.map((t) => `${t.schema}.${t.table}`);
+    // secret_tokens is not allowlisted; even though orders references customers,
+    // orders itself is not allowlisted so neither appears at all
+    expect(names).toContain("public.customers");
+    expect(names).not.toContain("public.secret_tokens");
+
+    // If we allow orders but not secret_tokens, the FK to secret_tokens must be hidden
+    const config2: AppConfig = {
+      database: {
+        readonlyConnectionString: READONLY_URL,
+        writerConnectionString: READONLY_URL,
+      },
+      allowlist: {
+        read: {
+          tables: ["public.orders"],
+        },
+        write: { schemas: [], tables: [] },
+      },
+    };
+    const tables2 = await describeSchema(roPool, config2);
+    const orders = tables2.find((t) => t.table === "orders");
+    expect(orders).toBeDefined();
+    expect(orders!.foreignKeys).toEqual([]);
+  });
+
   it("row-count estimates are numeric", async () => {
     const config = makeConfig();
     const tables = await describeSchema(roPool, config);

@@ -134,7 +134,10 @@ export async function describeSchema(
   const fksByTable = new Map<string, ForeignKeyInfo[]>();
   for (const fk of fkRes.rows) {
     const key = `${fk.table_schema}.${fk.table_name}`;
-    if (!allowedSet.has(key)) continue;
+    const referencedKey = `${fk.foreign_table_schema}.${fk.foreign_table_name}`;
+    // Drop FKs whose referenced table is outside the read allowlist so we never
+    // disclose metadata for tables the administrator intended to hide.
+    if (!allowedSet.has(key) || !allowedSet.has(referencedKey)) continue;
     const list = fksByTable.get(key) ?? [];
     list.push({
       constraintName: fk.constraint_name,

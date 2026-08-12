@@ -83,7 +83,8 @@ export async function describeSchema(
     `,
   );
 
-  // 3. Fetch foreign keys via pg_catalog (information_schema is unreliable across roles)
+  // 3. Fetch foreign keys via pg_catalog (information_schema is unreliable across roles).
+  // Use ordinal pairing for composite keys to avoid N×N cross-product from ANY joins.
   const fkRes = await pool.query<{
     constraint_name: string;
     table_schema: string;
@@ -105,12 +106,13 @@ export async function describeSchema(
     FROM pg_constraint con
     JOIN pg_class c ON c.oid = con.conrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    JOIN pg_attribute a ON a.attnum = ANY(con.conkey) AND a.attrelid = c.oid
     JOIN pg_class fc ON fc.oid = con.confrelid
     JOIN pg_namespace fn ON fn.oid = fc.relnamespace
-    JOIN pg_attribute fa ON fa.attnum = ANY(con.confkey) AND fa.attrelid = fc.oid
+    CROSS JOIN LATERAL generate_series(1, array_length(con.conkey, 1)) AS gs(ord)
+    JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[gs.ord]
+    JOIN pg_attribute fa ON fa.attrelid = con.confrelid AND fa.attnum = con.confkey[gs.ord]
     WHERE con.contype = 'f'
-    ORDER BY n.nspname, c.relname, con.conname
+    ORDER BY n.nspname, c.relname, con.conname, gs.ord
     `,
   );
 

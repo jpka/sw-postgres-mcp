@@ -135,15 +135,15 @@ export function loadConfig(configPath?: string): AppConfig {
 
   const database: DatabaseConfig = {
     readonlyConnectionString:
-      (dbRaw.readonlyConnectionString as string) ??
       process.env.DATABASE_URL_READONLY ??
       process.env.POSTGRES_READONLY_URL ??
+      (dbRaw.readonlyConnectionString as string) ??
       "",
     writerConnectionString:
-      (dbRaw.writerConnectionString as string) ??
       process.env.DATABASE_URL_WRITER ??
       process.env.POSTGRES_WRITER_URL ??
       process.env.DATABASE_URL ??
+      (dbRaw.writerConnectionString as string) ??
       "",
   };
 

@@ -73,5 +73,9 @@ Integration tests verify against a live Postgres: role separation, readonly cann
 ## Tools
 
 - `describe_schema` — tables, columns with types, foreign keys, row-count estimates (respects read allowlist).
+- `query` — run a read-only `SELECT` and return `{ columns, rows, row_count }`. Runs on the readonly role, so a mutating statement is refused by the database regardless of what the SQL says. Enforces a single statement per call and the read allowlist. Optional `limit` and `params`.
+- `explain_plan` — run `EXPLAIN (FORMAT JSON)` for a candidate read statement and return the planner's estimated `cost` and `rows` without executing it. A cheap pre-check before running something potentially expensive.
 
-More tools (`query`, `explain_plan`, `insert_rows`, `update_rows`, `delete_rows`, `run_migration`, `execute_plan`) arrive in later slices.
+Every tool takes a `reason` string (recorded in the audit log in a later slice) and returns errors as structured `{ code, message, hint }` — never a raw Postgres exception or a multi-statement batch.
+
+More tools (`insert_rows`, `update_rows`, `delete_rows`, `run_migration`, `execute_plan`) arrive in later slices.

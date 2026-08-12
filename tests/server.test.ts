@@ -7,7 +7,7 @@ import type { AppConfig } from "../src/config.js";
 import { createPools } from "../src/db.js";
 import { READONLY_URL, WRITER_URL, SUPERUSER_URL, waitForDb, withSuperuser } from "./helpers.js";
 
-describe("MCP server describe_schema", () => {
+describe("MCP server tools", () => {
   let client: Client;
   let serverPools: ReturnType<typeof createPools>;
 
@@ -80,5 +80,71 @@ describe("MCP server describe_schema", () => {
     const orders = parsed.tables.find((t) => t.table === "orders");
     expect(orders).toBeDefined();
     expect((orders!.foreignKeys as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it("query returns rows via call_tool", async () => {
+    const result = await client.callTool({
+      name: "query",
+      arguments: { statement: "SELECT id, email FROM customers ORDER BY id", reason: "server test" },
+    });
+    expect(result.isError).not.toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text) as { columns: string[]; rows: unknown[]; row_count: number };
+    expect(parsed.columns).toContain("email");
+    expect(parsed.row_count).toBe(1);
+    expect(parsed.rows).toHaveLength(1);
+  });
+
+  it("explain_plan returns cost and estimated rows via call_tool", async () => {
+    const result = await client.callTool({
+      name: "explain_plan",
+      arguments: { statement: "SELECT * FROM customers", reason: "server test" },
+    });
+    expect(result.isError).not.toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text) as { cost: number; rows: number; plan: unknown };
+    expect(typeof parsed.cost).toBe("number");
+    expect(typeof parsed.rows).toBe("number");
+    expect(parsed.plan).toBeDefined();
+  });
+
+  it("query rejects a call without reason with a structured error", async () => {
+    const result = await client.callTool({
+      name: "query",
+      arguments: { statement: "SELECT 1" },
+    });
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text) as { code: string; message: string; hint: string };
+    expect(parsed.code).toBe("INVALID_ARGUMENTS");
+    expect(parsed.message).toMatch(/reason/);
+    expect(parsed.hint).toBeTruthy();
+  });
+
+  it("multi-statement input surfaces as structured JSON, not a prefixed or raw error", async () => {
+    const result = await client.callTool({
+      name: "query",
+      arguments: { statement: "SELECT 1; SELECT 2", reason: "server test" },
+    });
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    expect(text).not.toMatch(/^query failed:/);
+    const parsed = JSON.parse(text) as { code: string; message: string; hint: string };
+    expect(parsed.code).toBe("MULTI_STATEMENT");
+    expect(parsed.hint).toBeTruthy();
+  });
+
+  it("database failures surface as structured JSON without raw Postgres exception text", async () => {
+    const result = await client.callTool({
+      name: "query",
+      arguments: { statement: "SELECT FROM nowhere_at_all", reason: "server test" },
+    });
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    expect(text).not.toMatch(/at or near/i);
+    expect(text).not.toMatch(/ERROR:/i);
+    const parsed = JSON.parse(text) as { code: string; message: string; hint: string };
+    expect(parsed.code).toBe("QUERY_FAILED");
+    expect(parsed.hint).toBeTruthy();
   });
 });

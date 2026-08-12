@@ -122,13 +122,3 @@ The rejected-then-adapted beat is the whole demo. Anyone can film a happy path.
 ## 7. What to write down as you go
 
 Keep a `DECISIONS.md` in the repo — why two-phase over `EXPLAIN`-only, why role separation over parsing, why tokens bind to statement hashes. Three or four short entries. It costs nothing during the build and it's the artifact that makes a reviewer conclude you think like an engineer rather than a tutorial-follower. It also becomes the blog post.
-
----
-
-## 8. Gig packaging (after the build)
-
-- **Starter $350** — read-only server against your database, 3 days.
-- **Standard $500** — safe-write with approval gating and audit log, 5 days.
-- **Advanced $2,500** — multi-tenant, hosted deployment, custom tool set, monitoring, 10 days.
-
-Lead the listing with the rejected-deletion demo video. It sells the safety layer faster than any copy.

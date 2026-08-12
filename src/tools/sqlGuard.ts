@@ -146,8 +146,6 @@ const CLAUSE_END_KEYWORDS = new Set([
   "INTERSECT",
   "EXCEPT",
   "RETURNING",
-  "ON",
-  "USING",
 ]);
 
 function skipWs(sql: string, i: number): number {
@@ -199,41 +197,42 @@ function readRelation(
   return { ref: parts.join("."), end: pos };
 }
 
-/**
- * After a relation, a FROM item may carry an alias (and join qualifiers like
- * LEFT/CROSS). Skip those words until a list separator, a JOIN, a clause
- * keyword, or the end of input, so the comma after an aliased item still
- * continues the list (`FROM a x, b` must capture b).
- */
-function scanAfterRelation(
+/** Index just past the `)` that closes the group opened at `open`, or -1. */
+function matchingParen(sql: string, open: number): number {
+  let depth = 0;
+  for (let j = open; j < sql.length; j++) {
+    if (sql[j] === "(") depth++;
+    else if (sql[j] === ")") {
+      depth--;
+      if (depth === 0) return j;
+    }
+  }
+  return -1;
+}
+
+/** Read the relation that follows `ONLY`, in either `ONLY t` or `ONLY (t)` form. */
+function readOnlyRelation(
   sql: string,
   start: number,
-): { next: number; continueList: boolean } {
+): { ref: string; end: number } | null {
   let pos = skipWs(sql, start);
-  for (;;) {
-    if (sql[pos] === ",") return { next: pos + 1, continueList: true };
-    const word = readWord(sql, pos);
-    if (!word) return { next: pos, continueList: false };
-    const upper = word.value.toUpperCase();
-    if (upper === "JOIN" || CLAUSE_END_KEYWORDS.has(upper)) {
-      return { next: pos, continueList: false };
-    }
-    if (upper === "AS") {
-      let p = skipWs(sql, word.end);
-      const alias = readWord(sql, p);
-      if (alias) p = alias.end;
-      pos = p;
-      continue;
-    }
-    pos = word.end;
+  if (sql[pos] === "(") {
+    const inner = readRelation(sql, skipWs(sql, pos + 1));
+    if (!inner) return null;
+    let end = skipWs(sql, inner.end);
+    if (sql[end] === ")") end++;
+    return { ref: inner.ref, end };
   }
+  return readRelation(sql, pos);
 }
 
 /**
  * Extract candidate table references from a sanitized statement. Walks the
  * token stream so every relation in a FROM/JOIN list is captured, including
  * comma-joins (`FROM t1, t2`), aliased items (`FROM a x, b`), the `ONLY` forms
- * (`ONLY t`, `ONLY (t)`), and `LATERAL` modifiers. Function calls and CTE
+ * (`ONLY t`, `ONLY (t)`), `LATERAL` modifiers, relations that follow a join
+ * condition (`FROM a JOIN b ON ..., c`), and relations inside parenthesized
+ * subqueries (derived tables, WHERE IN (...), CTEs). Function calls and CTE
  * names come back too; the allowlist check resolves each reference against the
  * catalog and only enforces on identifiers that are real relations.
  */
@@ -241,6 +240,7 @@ export function extractTableReferences(clean: string): string[] {
   const refs: string[] = [];
   let i = 0;
   let expectRelation = false;
+  let inFromClause = false;
 
   while (i < clean.length) {
     const ch = clean[i];
@@ -248,8 +248,20 @@ export function extractTableReferences(clean: string): string[] {
       i++;
       continue;
     }
+    if (ch === "(") {
+      const end = matchingParen(clean, i);
+      if (end === -1) {
+        i++;
+        continue;
+      }
+      refs.push(...extractTableReferences(clean.slice(i + 1, end)));
+      i = end + 1;
+      expectRelation = false;
+      continue;
+    }
     if (ch === ",") {
       i++;
+      if (inFromClause && !expectRelation) expectRelation = true;
       continue;
     }
 
@@ -258,55 +270,46 @@ export function extractTableReferences(clean: string): string[] {
       i++;
       continue;
     }
-
-    if (!expectRelation) {
-      if (CONTEXT_KEYWORDS.has(word.value.toUpperCase())) {
-        expectRelation = true;
-      }
-      i = word.end;
-      continue;
-    }
-
-    // expectRelation: the next token is a from-item (relation or a modifier).
     const upper = word.value.toUpperCase();
-    if (upper === "LATERAL") {
-      i = word.end;
-      expectRelation = true;
-      continue;
-    }
+
+    // ONLY always precedes a relation, with or without a preceding FROM.
     if (upper === "ONLY") {
-      let pos = skipWs(clean, word.end);
-      if (clean[pos] === "(") {
-        const inner = readRelation(clean, skipWs(clean, pos + 1));
-        if (inner) {
-          refs.push(inner.ref);
-          pos = inner.end;
-        }
-        pos = skipWs(clean, pos);
-        if (clean[pos] === ")") pos++;
+      const only = readOnlyRelation(clean, word.end);
+      if (only) {
+        refs.push(only.ref);
+        i = only.end;
       } else {
-        const rel = readRelation(clean, pos);
-        if (rel) {
-          refs.push(rel.ref);
-          pos = rel.end;
-        }
+        i = word.end;
       }
-      const after = scanAfterRelation(clean, pos);
-      i = after.next;
-      expectRelation = after.continueList;
+      expectRelation = false;
       continue;
     }
 
-    const rel = readRelation(clean, i);
-    if (rel) {
-      refs.push(rel.ref);
-      const after = scanAfterRelation(clean, rel.end);
-      i = after.next;
-      expectRelation = after.continueList;
-    } else {
-      i = word.end;
+    if (expectRelation) {
+      // expectRelation: the next token is a from-item (relation or a modifier).
+      if (upper === "LATERAL") {
+        i = word.end;
+        expectRelation = true;
+        continue;
+      }
+      const rel = readRelation(clean, i);
+      if (rel) {
+        refs.push(rel.ref);
+        i = rel.end;
+      } else {
+        i = word.end;
+      }
       expectRelation = false;
+      continue;
     }
+
+    if (CONTEXT_KEYWORDS.has(upper)) {
+      expectRelation = true;
+      inFromClause = true;
+    } else if (CLAUSE_END_KEYWORDS.has(upper)) {
+      inFromClause = false;
+    }
+    i = word.end;
   }
 
   return refs;

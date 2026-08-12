@@ -302,6 +302,86 @@ describe("query tool", () => {
     });
   });
 
+  it("derived tables are still allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: "SELECT * FROM (SELECT token FROM t3q_secret_tokens) AS sub", reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+  });
+
+  it("subqueries in WHERE are still allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: "SELECT * FROM t3q_customers WHERE id IN (SELECT id FROM t3q_secret_tokens)", reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+  });
+
+  it("relations after a JOIN ... ON condition are still allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: "SELECT * FROM t3q_customers c1 JOIN t3q_customers c2 ON c1.id = c2.id, t3q_secret_tokens", reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+  });
+
+  it("relations after a JOIN ... USING condition are still allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: "SELECT * FROM t3q_customers c1 JOIN t3q_customers c2 USING (id), t3q_secret_tokens", reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+  });
+
+  it("relations after a LEFT JOIN ... ON condition are still allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: "SELECT * FROM t3q_customers c1 LEFT JOIN t3q_customers c2 ON c1.id = c2.id, t3q_secret_tokens", reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+  });
+
   it("refuses a mutating statement with a structured error before hitting the database", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

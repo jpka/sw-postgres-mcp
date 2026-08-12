@@ -159,6 +159,45 @@ describe("query tool", () => {
     expect(allowed.row_count).toBe(2);
   });
 
+  it("parenthesized ONLY table references are still allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: "SELECT * FROM ONLY (t3q_secret_tokens)", reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+
+    const allowed = await runQuery(
+      roPool,
+      { statement: "SELECT * FROM ONLY (t3q_customers)", reason: "test" },
+      config,
+    );
+    expect(allowed.row_count).toBe(2);
+  });
+
+  it("comma-joined tables are all allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: "SELECT * FROM t3q_customers, t3q_secret_tokens", reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+  });
+
   it("refuses a mutating statement with a structured error before hitting the database", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

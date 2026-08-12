@@ -101,21 +101,135 @@ export function assertReadStatement(clean: string): void {
   }
 }
 
-const TABLE_REF_RE =
-  /(?:FROM|JOIN|UPDATE|INTO|TABLE)\s+(?:ONLY\s+)?((?:"(?:\"|[^"])*"|[A-Za-z_][A-Za-z0-9_$]*)(?:\s*\.\s*(?:"(?:\"|[^"])*"|[A-Za-z_][A-Za-z0-9_$]*))?)/gi;
+const CONTEXT_KEYWORDS = new Set(["FROM", "JOIN", "UPDATE", "INTO", "TABLE"]);
+
+function skipWs(sql: string, i: number): number {
+  while (i < sql.length && /\s/.test(sql[i])) i++;
+  return i;
+}
+
+/** Read an identifier (quoted or unquoted). Returns null when `start` is not one. */
+function readWord(sql: string, start: number): { value: string; end: number } | null {
+  const ch = sql[start];
+  if (ch === '"') {
+    let i = start + 1;
+    let out = "";
+    while (i < sql.length) {
+      if (sql[i] === '"') {
+        if (sql[i + 1] === '"') {
+          out += '"';
+          i += 2;
+          continue;
+        }
+        return { value: out, end: i + 1 };
+      }
+      out += sql[i];
+      i++;
+    }
+    return { value: out, end: sql.length };
+  }
+  const m = /^[A-Za-z_][A-Za-z0-9_$]*/.exec(sql.slice(start));
+  if (!m) return null;
+  return { value: m[0], end: start + m[0].length };
+}
+
+/** Read a possibly schema-qualified relation starting at `start`. */
+function readRelation(
+  sql: string,
+  start: number,
+): { ref: string; end: number } | null {
+  const first = readWord(sql, start);
+  if (!first) return null;
+  const parts = [first.value];
+  let pos = skipWs(sql, first.end);
+  if (sql[pos] === ".") {
+    const second = readWord(sql, skipWs(sql, pos + 1));
+    if (second) {
+      parts.push(second.value);
+      pos = skipWs(sql, second.end);
+    }
+  }
+  return { ref: parts.join("."), end: pos };
+}
 
 /**
- * Extract candidate table references from a sanitized statement. Function calls
- * and CTE names come back too; the allowlist check resolves each reference
- * against the catalog and only enforces on identifiers that are real relations.
+ * Extract candidate table references from a sanitized statement. Walks the
+ * token stream so every relation in a FROM/JOIN list is captured, including
+ * comma-joins (`FROM t1, t2`) and both `ONLY` forms (`ONLY t`, `ONLY (t)`).
+ * Function calls and CTE names come back too; the allowlist check resolves
+ * each reference against the catalog and only enforces on identifiers that are
+ * real relations.
  */
 export function extractTableReferences(clean: string): string[] {
   const refs: string[] = [];
-  for (const match of clean.matchAll(TABLE_REF_RE)) {
-    const raw = match[1].replace(/\s/g, "");
-    const parts = raw.split(".").map((p) => p.replace(/^"|"$/g, ""));
-    refs.push(parts.join("."));
+  let i = 0;
+  let expectRelation = false;
+
+  while (i < clean.length) {
+    const ch = clean[i];
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
+    }
+    if (ch === ",") {
+      i++;
+      continue;
+    }
+
+    const word = readWord(clean, i);
+    if (!word) {
+      i++;
+      continue;
+    }
+
+    if (!expectRelation) {
+      if (CONTEXT_KEYWORDS.has(word.value.toUpperCase())) {
+        expectRelation = true;
+      }
+      i = word.end;
+      continue;
+    }
+
+    // expectRelation: the next token is a relation, possibly `ONLY ...`.
+    let pos: number;
+    if (word.value.toUpperCase() === "ONLY") {
+      pos = skipWs(clean, word.end);
+      if (clean[pos] === "(") {
+        const inner = readRelation(clean, skipWs(clean, pos + 1));
+        if (inner) {
+          refs.push(inner.ref);
+          pos = inner.end;
+        }
+        pos = skipWs(clean, pos);
+        if (clean[pos] === ")") pos++;
+      } else {
+        const rel = readRelation(clean, pos);
+        if (rel) {
+          refs.push(rel.ref);
+          pos = rel.end;
+        }
+      }
+    } else {
+      const rel = readRelation(clean, i);
+      if (rel) {
+        refs.push(rel.ref);
+        pos = rel.end;
+      } else {
+        pos = word.end;
+      }
+    }
+
+    // A comma continues the FROM/JOIN list with another relation.
+    const next = skipWs(clean, pos);
+    if (clean[next] === ",") {
+      i = next + 1;
+      expectRelation = true;
+    } else {
+      i = next;
+      expectRelation = false;
+    }
   }
+
   return refs;
 }
 

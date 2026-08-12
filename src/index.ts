@@ -7,20 +7,17 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const pools = createPools(config);
 
-  // Verify distinct roles on startup. Same-role misconfiguration is fatal (would
-  // give the readonly pool writer privileges); connectivity failures are non-fatal
-  // so `npm run build` and offline checks still work.
+  // Verify distinct roles on startup. Any validation failure is fatal so a
+  // same-role misconfiguration cannot be masked by a transient connectivity error
+  // and later serve requests through a nominal readonly pool with writer privileges.
   try {
     await assertRolesDistinct(pools);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("must use distinct roles")) {
-      console.error(`[sw-postgres-mcp] distinct-role check failed: ${msg}`);
-      await pools.readonlyPool.end().catch(() => {});
-      await pools.writerPool.end().catch(() => {});
-      throw err;
-    }
-    console.error(`[sw-postgres-mcp] role check warning (connectivity?): ${msg}`);
+    console.error(`[sw-postgres-mcp] distinct-role check failed: ${msg}`);
+    await pools.readonlyPool.end().catch(() => {});
+    await pools.writerPool.end().catch(() => {});
+    throw err;
   }
 
   const onExit = async () => {

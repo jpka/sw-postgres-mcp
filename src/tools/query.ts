@@ -34,11 +34,15 @@ export async function runQuery(
   assertReadStatement(clean);
   await assertTablesAllowlisted(pool, clean, config);
 
+  // A trailing semicolon (optionally followed by a comment) would break the
+  // derived-table wrapper, so drop it before wrapping.
+  const base = args.statement.replace(/;\s*(--[^\n]*|\/\*[\s\S]*?\*\/)?$/, "").trimEnd();
+
   // Apply the requested limit by wrapping, so it composes with statements that
   // already carry their own LIMIT and never conflicts with one.
   const finalSql =
     typeof args.limit === "number"
-      ? `SELECT * FROM (${args.statement}) AS _q LIMIT ${args.limit}`
+      ? `SELECT * FROM (${base}) AS _q LIMIT ${args.limit}`
       : args.statement;
 
   try {

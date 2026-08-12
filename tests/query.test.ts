@@ -102,6 +102,46 @@ describe("query tool", () => {
     expect(result.rows[0].email).toBe("a@example.com");
   });
 
+  it("handles a trailing semicolon when a limit is applied", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    const result = await runQuery(
+      roPool,
+      {
+        statement: "SELECT id, email FROM t3q_customers ORDER BY id;",
+        limit: 1,
+        reason: "test trailing semicolon",
+      },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+  });
+
+  it("ONLY table references are still allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: "SELECT * FROM ONLY t3q_secret_tokens", reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+
+    const allowed = await runQuery(
+      roPool,
+      { statement: "SELECT * FROM ONLY t3q_customers", reason: "test" },
+      config,
+    );
+    expect(allowed.row_count).toBe(2);
+  });
+
   it("refuses a mutating statement with a structured error before hitting the database", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

@@ -102,7 +102,7 @@ export function assertReadStatement(clean: string): void {
 }
 
 const TABLE_REF_RE =
-  /(?:FROM|JOIN|UPDATE|INTO|TABLE)\s+((?:"(?:\"|[^"])*"|[A-Za-z_][A-Za-z0-9_$]*)(?:\s*\.\s*(?:"(?:\"|[^"])*"|[A-Za-z_][A-Za-z0-9_$]*))?)/gi;
+  /(?:FROM|JOIN|UPDATE|INTO|TABLE)\s+(?:ONLY\s+)?((?:"(?:\"|[^"])*"|[A-Za-z_][A-Za-z0-9_$]*)(?:\s*\.\s*(?:"(?:\"|[^"])*"|[A-Za-z_][A-Za-z0-9_$]*))?)/gi;
 
 /**
  * Extract candidate table references from a sanitized statement. Function calls

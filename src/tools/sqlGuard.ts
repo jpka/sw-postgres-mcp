@@ -69,7 +69,7 @@ function scanStatement(sql: string): ScanResult {
       }
     }
 
-    if (ch !== ";") lastRealEnd = i + 1;
+    if (ch !== ";" && !/\s/.test(ch)) lastRealEnd = i + 1;
     out += ch;
     i++;
   }

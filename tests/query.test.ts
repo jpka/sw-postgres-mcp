@@ -226,6 +226,18 @@ describe("query tool", () => {
     expect(result.rows[0].marker).toBe("y");
   });
 
+  it("a terminator followed by whitespace and a trailing comment is dropped before a limit wrapper", async () => {
+    const config = makeConfig();
+    const result = await runQuery(
+      roPool,
+      { statement: "SELECT 1 AS n; -- trailing comment", limit: 1, reason: "test" },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+    expect(result.rows[0].n).toBe(1);
+  });
+
   it("ONLY table references are still allowlist-checked", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

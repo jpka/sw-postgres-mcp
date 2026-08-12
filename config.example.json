@@ -1,0 +1,16 @@
+{
+  "database": {
+    "readonlyConnectionString": "postgres://readonly:readonly_password@localhost:5432/mcp_test",
+    "writerConnectionString": "postgres://writer:writer_password@localhost:5432/mcp_test"
+  },
+  "allowlist": {
+    "read": {
+      "schemas": ["public"],
+      "tables": []
+    },
+    "write": {
+      "schemas": [],
+      "tables": []
+    }
+  }
+}

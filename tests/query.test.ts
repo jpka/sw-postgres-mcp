@@ -119,6 +119,23 @@ describe("query tool", () => {
     expect(result.row_count).toBe(1);
   });
 
+  it("handles multiple trailing semicolons when a limit is applied", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    const result = await runQuery(
+      roPool,
+      {
+        statement: "SELECT id, email FROM t3q_customers ORDER BY id;;",
+        limit: 1,
+        reason: "test multiple trailing semicolons",
+      },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+  });
+
   it("ONLY table references are still allowlist-checked", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

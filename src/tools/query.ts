@@ -34,9 +34,18 @@ export async function runQuery(
   assertReadStatement(clean);
   await assertTablesAllowlisted(pool, clean, config);
 
-  // A trailing semicolon (optionally followed by a comment) would break the
-  // derived-table wrapper, so drop it before wrapping.
-  const base = args.statement.replace(/;\s*(--[^\n]*|\/\*[\s\S]*?\*\/)?$/, "").trimEnd();
+  // Trailing terminators (and any interleaved trailing comments) would break the
+  // derived-table wrapper, so drop them before wrapping.
+  let base = args.statement.trimEnd();
+  for (;;) {
+    const before = base;
+    base = base
+      .replace(/(?:--[^\n]*|\/\*[\s\S]*?\*\/)\s*$/, "")
+      .trimEnd()
+      .replace(/;\s*$/, "")
+      .trimEnd();
+    if (base === before) break;
+  }
 
   // Apply the requested limit by wrapping, so it composes with statements that
   // already carry their own LIMIT and never conflicts with one.

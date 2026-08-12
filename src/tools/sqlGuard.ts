@@ -102,6 +102,23 @@ export function assertReadStatement(clean: string): void {
 }
 
 const CONTEXT_KEYWORDS = new Set(["FROM", "JOIN", "UPDATE", "INTO", "TABLE"]);
+const CLAUSE_END_KEYWORDS = new Set([
+  "WHERE",
+  "GROUP",
+  "HAVING",
+  "ORDER",
+  "LIMIT",
+  "OFFSET",
+  "FETCH",
+  "FOR",
+  "WINDOW",
+  "UNION",
+  "INTERSECT",
+  "EXCEPT",
+  "RETURNING",
+  "ON",
+  "USING",
+]);
 
 function skipWs(sql: string, i: number): number {
   while (i < sql.length && /\s/.test(sql[i])) i++;
@@ -153,12 +170,42 @@ function readRelation(
 }
 
 /**
+ * After a relation, a FROM item may carry an alias (and join qualifiers like
+ * LEFT/CROSS). Skip those words until a list separator, a JOIN, a clause
+ * keyword, or the end of input, so the comma after an aliased item still
+ * continues the list (`FROM a x, b` must capture b).
+ */
+function scanAfterRelation(
+  sql: string,
+  start: number,
+): { next: number; continueList: boolean } {
+  let pos = skipWs(sql, start);
+  for (;;) {
+    if (sql[pos] === ",") return { next: pos + 1, continueList: true };
+    const word = readWord(sql, pos);
+    if (!word) return { next: pos, continueList: false };
+    const upper = word.value.toUpperCase();
+    if (upper === "JOIN" || CLAUSE_END_KEYWORDS.has(upper)) {
+      return { next: pos, continueList: false };
+    }
+    if (upper === "AS") {
+      let p = skipWs(sql, word.end);
+      const alias = readWord(sql, p);
+      if (alias) p = alias.end;
+      pos = p;
+      continue;
+    }
+    pos = word.end;
+  }
+}
+
+/**
  * Extract candidate table references from a sanitized statement. Walks the
  * token stream so every relation in a FROM/JOIN list is captured, including
- * comma-joins (`FROM t1, t2`) and both `ONLY` forms (`ONLY t`, `ONLY (t)`).
- * Function calls and CTE names come back too; the allowlist check resolves
- * each reference against the catalog and only enforces on identifiers that are
- * real relations.
+ * comma-joins (`FROM t1, t2`), aliased items (`FROM a x, b`), the `ONLY` forms
+ * (`ONLY t`, `ONLY (t)`), and `LATERAL` modifiers. Function calls and CTE
+ * names come back too; the allowlist check resolves each reference against the
+ * catalog and only enforces on identifiers that are real relations.
  */
 export function extractTableReferences(clean: string): string[] {
   const refs: string[] = [];
@@ -190,10 +237,15 @@ export function extractTableReferences(clean: string): string[] {
       continue;
     }
 
-    // expectRelation: the next token is a relation, possibly `ONLY ...`.
-    let pos: number;
-    if (word.value.toUpperCase() === "ONLY") {
-      pos = skipWs(clean, word.end);
+    // expectRelation: the next token is a from-item (relation or a modifier).
+    const upper = word.value.toUpperCase();
+    if (upper === "LATERAL") {
+      i = word.end;
+      expectRelation = true;
+      continue;
+    }
+    if (upper === "ONLY") {
+      let pos = skipWs(clean, word.end);
       if (clean[pos] === "(") {
         const inner = readRelation(clean, skipWs(clean, pos + 1));
         if (inner) {
@@ -209,23 +261,20 @@ export function extractTableReferences(clean: string): string[] {
           pos = rel.end;
         }
       }
-    } else {
-      const rel = readRelation(clean, i);
-      if (rel) {
-        refs.push(rel.ref);
-        pos = rel.end;
-      } else {
-        pos = word.end;
-      }
+      const after = scanAfterRelation(clean, pos);
+      i = after.next;
+      expectRelation = after.continueList;
+      continue;
     }
 
-    // A comma continues the FROM/JOIN list with another relation.
-    const next = skipWs(clean, pos);
-    if (clean[next] === ",") {
-      i = next + 1;
-      expectRelation = true;
+    const rel = readRelation(clean, i);
+    if (rel) {
+      refs.push(rel.ref);
+      const after = scanAfterRelation(clean, rel.end);
+      i = after.next;
+      expectRelation = after.continueList;
     } else {
-      i = next;
+      i = word.end;
       expectRelation = false;
     }
   }

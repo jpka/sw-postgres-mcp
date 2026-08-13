@@ -2,6 +2,7 @@
   "name": "sw-postgres-mcp",
   "version": "0.1.0",
   "description": "Safe-write Postgres MCP server with dual-role pools and preview-before-execute",
+  "mcpName": "io.github.jpka/sw-postgres-mcp",
   "type": "module",
   "license": "MIT",
   "author": "jpka",

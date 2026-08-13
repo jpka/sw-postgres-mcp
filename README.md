@@ -300,6 +300,19 @@ Stated plainly, not hidden:
 - **`run_migration`'s allowlist enforcement doesn't cover every DDL form.** `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, and `CREATE [UNIQUE] INDEX ... ON <table>` are supported; a bare `DROP INDEX <name>` is refused outright (`UNSUPPORTED`) rather than allowlist-checked, because the table an index belongs to can't be determined from that statement's text alone. See `DECISIONS.md` (#9).
 - **Single-statement, single-database.** Every tool refuses multi-statement input and there is no cross-statement/cross-table transaction spanning multiple tool calls — each `delete_rows`/`insert_rows`/`update_rows`/`run_migration` call is its own independent preview/execute pair. There's no way to preview two related writes (e.g. an `UPDATE` plus a dependent `INSERT`) and approve them as one atomic unit.
 
+## Publishing to the MCP Registry
+
+`server.json` is the committed manifest for the official [MCP Registry](https://registry.modelcontextprotocol.io). `tests/serverJson.test.ts` checks it carries the registry schema URL and the key manifest properties (reverse-DNS name, version, npm package entry, `stdio` transport, required env vars), and keeps it in sync with `package.json` — its `name` must equal the `mcpName` field in `package.json`, which is the npm ownership-verification marker the registry checks on publish.
+
+Publishing is a CLI flow (not a GitHub PR) and requires the npm package to already exist:
+
+1. Publish to npm: `npm run build && npm publish` (see issue #24).
+2. Install the publisher: `brew install mcp-publisher`, or download the release binary from [`modelcontextprotocol/registry`](https://github.com/modelcontextprotocol/registry/releases).
+3. Authenticate: `mcp-publisher login github` (device flow).
+4. Publish: `mcp-publisher publish` — reads `server.json` and registers the server.
+
+The manifest's `name` (`io.github.jpka/sw-postgres-mcp`) is namespaced under the GitHub account, so GitHub authentication is sufficient — no DNS challenge. The `DATABASE_URL_READONLY` / `DATABASE_URL_WRITER` environment variables it declares are the same connection strings the [Configuration](#configuration) section describes.
+
 ## License
 
 [MIT](./LICENSE)

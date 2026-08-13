@@ -38,7 +38,9 @@ const deleteRowsSchema = z.object({
   where: z.string().optional(),
   params: z.array(z.unknown()).optional(),
   confirm_full_table: z.boolean().optional(),
-  reason: z.string().optional(),
+  // Required to match the tool's declared inputSchema below and so every
+  // audit row for a write carries a real reason (see mcp_audit.log).
+  reason: z.string().min(1),
 });
 
 const executePlanSchema = z.object({
@@ -114,6 +116,7 @@ export function createServer(pools: Pools, config: AppConfig): Server {
     pool: pools.writerPool,
     planTtlMs: config.write.planTtlMs,
     statementTimeoutMs: config.write.statementTimeoutMs,
+    callerId: config.callerId,
   });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({

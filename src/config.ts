@@ -34,6 +34,14 @@ export interface AppConfig {
   database: DatabaseConfig;
   allowlist: AllowlistConfig;
   write: WriteConfig;
+  /**
+   * Identity recorded as `caller_id` on every mcp_audit.log row this server
+   * instance writes. The server has no per-request authentication (see
+   * DECISIONS.md / build plan risks — "no auth beyond local config" is a
+   * deliberate v1 scope limit), so this identifies the deployment/agent
+   * session as a whole rather than an individual end user. Default "unknown".
+   */
+  callerId?: string;
 }
 
 function parseAllowlistSection(raw: unknown): AllowlistSection {
@@ -196,5 +204,12 @@ export function loadConfig(configPath?: string): AppConfig {
     );
   }
 
-  return { database, allowlist, write };
+  const callerId =
+    process.env.SW_CALLER_ID ??
+    (typeof r.callerId === "string" && r.callerId.trim().length > 0
+      ? r.callerId
+      : undefined) ??
+    "unknown";
+
+  return { database, allowlist, write, callerId };
 }

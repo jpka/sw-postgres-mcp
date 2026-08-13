@@ -35,14 +35,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Provision roles
+      - name: Provision roles and schemas
         run: |
           # Wait for postgres to be ready (services healthcheck already, but be explicit)
           for i in {1..20}; do
             pg_isready -h localhost -p 5432 -U postgres && break
             sleep 1
           done
-          psql "postgres://postgres:postgres@localhost:5432/mcp_test" -f docker/init/01-roles.sql
+          # Apply every init script in the same order docker-entrypoint-initdb.d
+          # would (alphabetical), so CI's live-service Postgres matches what the
+          # disposable docker-compose database gets on first boot.
+          for f in docker/init/*.sql; do
+            psql "postgres://postgres:postgres@localhost:5432/mcp_test" -f "$f"
+          done
         env:
           PGPASSWORD: postgres
 

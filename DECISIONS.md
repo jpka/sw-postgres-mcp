@@ -5,6 +5,89 @@ were, what we picked, and the reasoning a reviewer can check. Newest first.
 
 ---
 
+## 2026-08-13 — Approval mechanism's shape: a flag on the plan token, no separate approvals table
+
+**Ticket:** #6 (approval threshold, hard row cap, `awaiting_approval`). Read by: #7
+(localhost approval UI), which is expected to build its "approve" / "reject" buttons
+on top of what's described here rather than invent its own storage.
+
+**Question:** #6 needs *some* concrete way for a plan to go from "awaiting approval" to
+"approved" — #7 explicitly "unlocks `execute_plan`" on top of it, but #7's actual UI is
+out of scope here. What is the smallest mechanism that is still a real, documented
+contract #7 can build on, rather than a placeholder #7 has to redesign?
+
+### What #6 builds
+
+- Two new `write` config thresholds, both compared against the **exact** rollback-preview
+  row count (`TwoPhaseWrite.preview`'s `affectedRows`), never an `EXPLAIN` estimate:
+  `approvalRequiredAboveRows` (default 100) and `hardMaxRows` (default 10,000, must be
+  `>= approvalRequiredAboveRows`).
+- A plan token's in-memory record (`TokenEntry` in `src/writeCore.ts`, alongside the
+  fingerprint/expiry/used-once state ticket #4 already put there) gained two fields:
+  `requiresApproval` (set once, at preview time, from the threshold check above) and
+  `approved` (`true` immediately if `!requiresApproval`; otherwise flipped by approval).
+  `execute_plan` refuses with `AWAITING_APPROVAL` while `requiresApproval && !approved`.
+- `TwoPhaseWrite.approvePlan(planToken, approvedBy)` is the entire approval mechanism:
+  it looks up the token, flips `approved = true`, and writes an `approved` audit row
+  (`approved_by` = the caller-supplied identity, default `"unknown"`). It does not
+  consume the token — `execute_plan` still runs its own statement/fingerprint/expiry/
+  rowset checks afterward, unchanged. It is idempotent (approving twice, or approving a
+  token that never required approval, both just succeed).
+- Exposed today as the `approve_plan` MCP tool (`plan_token`, optional `approved_by`) —
+  a real, callable mechanism, not a stub, so it can be exercised by tests and by hand
+  before any UI exists.
+- A row over `hardMaxRows` never reaches any of the above: no token is created at all
+  (`HARD_MAX_ROWS_EXCEEDED`, audited as `hard_cap_refused`). There is nothing for an
+  approval mechanism to act on in that case by design — the ticket's "wall, not a gate."
+
+### What #6 deliberately does not build
+
+- **No `reject_plan` / no `rejected` audit status wired up.** `mcp_audit.log.status`
+  already had `rejected` in its enum (anticipated by #5), and this ticket's migration
+  (`docker/init/03-approval-workflow.sql`) leaves it in place, but nothing in #6 writes
+  it. Rejection is #7's acceptance criteria (permanently invalidate the token; refuse
+  even a correct statement afterward) and #7's to build, most likely as
+  `TwoPhaseWrite.rejectPlan` alongside `approvePlan`, deleting the token from the store
+  outright rather than approving it.
+- **No standalone approvals table.** The plan token is already the unit `execute_plan`
+  is scoped to, and it already lives somewhere ticket #4 built for exactly this kind of
+  short-lived, single-use state — an in-memory `TokenStore` inside one running
+  `TwoPhaseWrite` instance. Approval state is one more flag on that same record, not a
+  new subsystem. This does mean approval is scoped to the process that issued the
+  preview (same as the token's expiry and single-use guarantee already were) — a plan
+  previewed against one server instance cannot be approved from another. That was
+  already true of every other property of a plan token before this ticket; #7's
+  same-process localhost page does not change it.
+- **No listing/query API for pending plans.** #7 needs "list what's awaiting approval"
+  for its page. #6 does not add a `list_pending_plans`-shaped tool; the `TokenStore` has
+  no enumeration method today. #7 will need to add one (e.g. an accessor on `TokenStore`
+  exposing entries with `requiresApproval && !approved && !used && !expired`, or reading
+  `mcp_audit.log` for the most recent `awaiting_approval` row per un-superseded
+  `plan_token`) — either is compatible with what's here.
+
+### Why this shape, not a database-backed approvals table
+
+A DB table would survive a server restart and be inspectable directly with `query`
+without a bespoke listing tool — real advantages. It was not chosen because the plan
+token itself does not survive a server restart either (the whole two-phase-write core is
+in-memory and TTL'd), so a persisted approval record would outlive the thing it approves
+by design, which is more confusing than convenient: an operator could "approve" a token
+that has already silently expired. Keeping approval state exactly as durable as the plan
+it approves — no more, no less — was judged the more honest contract. The audit log
+already gives durability for the *history* of what was approved and by whom; it is just
+not the thing `execute_plan` checks live.
+
+### For #7
+
+Two front-ends over one mechanism, same framing as the 2026-08-12 entry below:
+`approve_plan` (this ticket) is the whole "approve" button's backend already. #7 mainly
+needs to add (a) a way to list pending (`awaiting_approval`, unexpired, unused) plans,
+and (b) a symmetric `reject_plan` that deletes the token instead of approving it and
+returns a rejection `execute_plan` can distinguish from `AWAITING_APPROVAL` /
+`EXPIRED_TOKEN` / `USED_TOKEN` (its own new `WriteErrorCode`, e.g. `PLAN_REJECTED`).
+
+---
+
 ## 2026-08-12 — Approval route: out-of-band localhost UI; spec-native elicitation deferred to client support
 
 **Ticket:** #1 (spike: how the current MCP spec handles human-in-the-loop approval).

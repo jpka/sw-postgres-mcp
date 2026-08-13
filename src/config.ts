@@ -23,11 +23,28 @@ export interface WriteConfig {
   planTtlMs: number;
   /** Per-connection statement_timeout for write executions, in milliseconds. Default 10_000. */
   statementTimeoutMs: number;
+  /**
+   * A preview whose exact rollback-preview affected-row count is at or below
+   * this threshold returns a token `execute_plan` will honour immediately.
+   * Above it, the preview returns `status: "awaiting_approval"` instead — the
+   * token exists but `execute_plan` refuses it until `approve_plan` marks it
+   * approved. Default 100.
+   */
+  approvalRequiredAboveRows: number;
+  /**
+   * A preview whose exact rollback-preview affected-row count exceeds this
+   * (separate, higher) threshold is refused outright: no token is issued and
+   * there is no approval path, regardless of `approvalRequiredAboveRows`.
+   * Default 10_000. Must be >= approvalRequiredAboveRows.
+   */
+  hardMaxRows: number;
 }
 
 export const DEFAULT_WRITE_CONFIG: WriteConfig = {
   planTtlMs: 60_000,
   statementTimeoutMs: 10_000,
+  approvalRequiredAboveRows: 100,
+  hardMaxRows: 10_000,
 };
 
 export interface AppConfig {
@@ -140,7 +157,24 @@ export function loadConfig(configPath?: string): AppConfig {
       positiveIntOrThrow(process.env.SW_STATEMENT_TIMEOUT_MS, "statementTimeoutMs") ??
       positiveIntOrThrow(writeRaw.statementTimeoutMs, "statementTimeoutMs") ??
       DEFAULT_WRITE_CONFIG.statementTimeoutMs,
+    approvalRequiredAboveRows:
+      positiveIntOrThrow(
+        process.env.SW_APPROVAL_REQUIRED_ABOVE_ROWS,
+        "approvalRequiredAboveRows",
+      ) ??
+      positiveIntOrThrow(writeRaw.approvalRequiredAboveRows, "approvalRequiredAboveRows") ??
+      DEFAULT_WRITE_CONFIG.approvalRequiredAboveRows,
+    hardMaxRows:
+      positiveIntOrThrow(process.env.SW_HARD_MAX_ROWS, "hardMaxRows") ??
+      positiveIntOrThrow(writeRaw.hardMaxRows, "hardMaxRows") ??
+      DEFAULT_WRITE_CONFIG.hardMaxRows,
   };
+
+  if (write.hardMaxRows < write.approvalRequiredAboveRows) {
+    throw new Error(
+      `write.hardMaxRows (${write.hardMaxRows}) must be >= write.approvalRequiredAboveRows (${write.approvalRequiredAboveRows})`,
+    );
+  }
 
   // Allowlist supports both nested {read, write} and legacy flat keys for backwards compat
   let allowlist: AllowlistConfig;

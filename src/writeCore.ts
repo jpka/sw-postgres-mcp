@@ -11,7 +11,9 @@ export type WriteErrorCode =
   | "STATEMENT_TIMEOUT"
   | "NO_WHERE_CLAUSE"
   | "TABLE_NOT_WRITABLE"
-  | "INVALID_TABLE_NAME";
+  | "INVALID_TABLE_NAME"
+  | "AWAITING_APPROVAL"
+  | "HARD_MAX_ROWS_EXCEEDED";
 
 export class WriteError extends Error {
   readonly code: WriteErrorCode;
@@ -33,6 +35,12 @@ export interface WritePreview {
   statement: string;
   /** The exact params that execute_plan must replay. */
   params: readonly unknown[];
+  /**
+   * "previewed" — the token is usable via execute_plan right away.
+   * "awaiting_approval" — affectedRows exceeded approvalRequiredAboveRows;
+   * the token exists but execute_plan refuses it until approvePlan is called.
+   */
+  status: "previewed" | "awaiting_approval";
 }
 
 export interface ExecuteResult {
@@ -43,11 +51,27 @@ export interface TwoPhaseWriteOptions {
   pool: pg.Pool;
   planTtlMs: number;
   statementTimeoutMs: number;
+  /**
+   * A preview whose exact rollback-preview affectedRows is at or below this
+   * returns an immediately-executable token. Above it, the preview returns
+   * `status: "awaiting_approval"` and the token needs `approvePlan` first.
+   * Default 100 (see config.ts DEFAULT_WRITE_CONFIG).
+   */
+  approvalRequiredAboveRows?: number;
+  /**
+   * A preview whose exact rollback-preview affectedRows exceeds this is
+   * refused outright: no token is issued. Must be >= approvalRequiredAboveRows.
+   * Default 10_000 (see config.ts DEFAULT_WRITE_CONFIG).
+   */
+  hardMaxRows?: number;
   /** Identity recorded as `caller_id` on every audit row this instance writes. Default "unknown". */
   callerId?: string;
   /** Audit sink. Defaults to an `AuditLog` writing through `pool` (the writer role). */
   auditLog?: AuditLog;
 }
+
+const DEFAULT_APPROVAL_REQUIRED_ABOVE_ROWS = 100;
+const DEFAULT_HARD_MAX_ROWS = 10_000;
 
 /** Per-call context recorded onto the audit trail. `tool` names the MCP tool driving this preview. */
 export interface WriteMeta {
@@ -69,6 +93,10 @@ interface TokenEntry extends TokenMeta {
   rowsDigest: string;
   expiresAt: number;
   used: boolean;
+  /** True when previewRows exceeded approvalRequiredAboveRows at preview time. */
+  requiresApproval: boolean;
+  /** Always true when !requiresApproval; flipped by TokenStore.approve() otherwise. */
+  approved: boolean;
 }
 
 /**
@@ -93,12 +121,21 @@ type ConsumeResult =
   | { ok: true; rowsDigest: string; meta: TokenMeta }
   | { ok: false; error: WriteError; meta?: TokenMeta };
 
+type ApproveResult =
+  | { ok: true; alreadyApproved: boolean; meta: TokenMeta }
+  | { ok: false; error: WriteError; meta?: TokenMeta };
+
 class TokenStore {
   private tokens = new Map<string, TokenEntry>();
 
   constructor(private ttlMs: number) {}
 
-  create(fingerprint: string, rowsDigest: string, meta: TokenMeta): string {
+  create(
+    fingerprint: string,
+    rowsDigest: string,
+    meta: TokenMeta,
+    requiresApproval: boolean,
+  ): string {
     this.prune();
     const token = randomBytes(24).toString("hex");
     this.tokens.set(token, {
@@ -106,9 +143,63 @@ class TokenStore {
       rowsDigest,
       expiresAt: Date.now() + this.ttlMs,
       used: false,
+      requiresApproval,
+      approved: !requiresApproval,
       ...meta,
     });
     return token;
+  }
+
+  /**
+   * Marks a plan token approved so a subsequent `consume()` (via
+   * `TwoPhaseWrite.execute`) no longer refuses it with `AWAITING_APPROVAL`.
+   * Does not consume the token — execute_plan still runs its own statement,
+   * fingerprint, expiry, and rowset checks afterward.
+   */
+  approve(token: string): ApproveResult {
+    const entry = this.tokens.get(token);
+    const meta: TokenMeta | undefined = entry
+      ? {
+          tool: entry.tool,
+          reason: entry.reason,
+          callerId: entry.callerId,
+          previewRows: entry.previewRows,
+        }
+      : undefined;
+
+    if (!entry) {
+      return {
+        ok: false,
+        error: new WriteError(
+          "UNKNOWN_TOKEN",
+          "No plan matches this token. It may have been revoked or never issued.",
+        ),
+      };
+    }
+    if (entry.used) {
+      return {
+        ok: false,
+        error: new WriteError(
+          "USED_TOKEN",
+          "This plan token was already used and can no longer be approved.",
+        ),
+        meta,
+      };
+    }
+    if (Date.now() > entry.expiresAt) {
+      this.tokens.delete(token);
+      return {
+        ok: false,
+        error: new WriteError(
+          "EXPIRED_TOKEN",
+          "This plan token has expired. Re-run the write to obtain a fresh preview and token.",
+        ),
+        meta,
+      };
+    }
+    const alreadyApproved = entry.approved;
+    entry.approved = true;
+    return { ok: true, alreadyApproved, meta: meta! };
   }
 
   consume(token: string, fingerprint: string): ConsumeResult {
@@ -167,6 +258,19 @@ class TokenStore {
         meta,
       };
     }
+    if (entry.requiresApproval && !entry.approved) {
+      // Deliberately does not delete or mark the token used: it stays
+      // pending so a later approve_plan + execute_plan can still succeed.
+      return {
+        ok: false,
+        error: new WriteError(
+          "AWAITING_APPROVAL",
+          "This plan affected more rows than the approval threshold allows and has not been approved yet.",
+          "Ask a human to approve this plan (approve_plan), or narrow the statement and re-preview to stay under the threshold.",
+        ),
+        meta,
+      };
+    }
     entry.used = true;
     return { ok: true, rowsDigest: entry.rowsDigest, meta: meta! };
   }
@@ -200,11 +304,16 @@ export class TwoPhaseWrite {
   private store: TokenStore;
   private auditLog: AuditLog;
   private callerId: string;
+  private approvalRequiredAboveRows: number;
+  private hardMaxRows: number;
 
   constructor(private opts: TwoPhaseWriteOptions) {
     this.store = new TokenStore(opts.planTtlMs);
     this.auditLog = opts.auditLog ?? new AuditLog(opts.pool);
     this.callerId = opts.callerId ?? "unknown";
+    this.approvalRequiredAboveRows =
+      opts.approvalRequiredAboveRows ?? DEFAULT_APPROVAL_REQUIRED_ABOVE_ROWS;
+    this.hardMaxRows = opts.hardMaxRows ?? DEFAULT_HARD_MAX_ROWS;
   }
 
   async preview(
@@ -226,15 +335,50 @@ export class TwoPhaseWrite {
         sample_rows: unknown;
         rows_digest: string;
       };
+      // The exact count from the rolled-back preview — never an EXPLAIN
+      // estimate. Both thresholds below compare against this number.
       const affectedRows = Number(row.affected_rows);
       const sampleRows = Array.isArray(row.sample_rows)
         ? row.sample_rows
         : [];
 
+      if (affectedRows > this.hardMaxRows) {
+        // A wall, not a gate: no token is issued, there is nothing to
+        // approve, and the response must read as final rather than as
+        // something to escalate past.
+        await this.auditLog.record(
+          {
+            tool: meta.tool,
+            reason,
+            statement,
+            params,
+            previewRows: affectedRows,
+            actualRows: null,
+            planToken: null,
+            approvedBy: null,
+            status: "hard_cap_refused",
+            durationMs: Date.now() - startedAt,
+            callerId: this.callerId,
+          },
+          client,
+        );
+        throw new WriteError(
+          "HARD_MAX_ROWS_EXCEEDED",
+          `This statement would affect ${affectedRows} rows, above the hard cap of ${this.hardMaxRows}. No plan token was issued and there is no approval path for this — it cannot be executed as written.`,
+          "Rewrite the statement to affect fewer rows (e.g. a narrower WHERE clause or batching), then re-preview.",
+        );
+      }
+
+      const requiresApproval = affectedRows > this.approvalRequiredAboveRows;
+      const status: WritePreview["status"] = requiresApproval
+        ? "awaiting_approval"
+        : "previewed";
+
       const planToken = this.store.create(
         statementFingerprint(statement, params),
         row.rows_digest,
         { tool: meta.tool, reason, callerId: this.callerId, previewRows: affectedRows },
+        requiresApproval,
       );
 
       // Recorded on the same connection, after ROLLBACK has ended the preview
@@ -250,16 +394,23 @@ export class TwoPhaseWrite {
           actualRows: null,
           planToken,
           approvedBy: null,
-          status: "previewed",
+          status,
           durationMs: Date.now() - startedAt,
           callerId: this.callerId,
         },
         client,
       );
 
-      return { planToken, affectedRows, sampleRows, statement, params };
+      return { planToken, affectedRows, sampleRows, statement, params, status };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
+      // HARD_MAX_ROWS_EXCEEDED is thrown deliberately above, after already
+      // writing its own "hard_cap_refused" audit row — logging a second
+      // "failed" row here for the same preview would be a duplicate, not a
+      // distinct outcome.
+      if (err instanceof WriteError && err.code === "HARD_MAX_ROWS_EXCEEDED") {
+        throw err;
+      }
       const translated = translateDbError(err);
       await this.auditLog.record(
         {
@@ -378,6 +529,60 @@ export class TwoPhaseWrite {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Marks a plan token approved so `execute_plan` will honour it despite
+   * `AWAITING_APPROVAL`. This is the whole approval mechanism ticket #6
+   * builds: an internal/programmatic entry point (also exposed as the
+   * `approve_plan` MCP tool in server.ts) that a later human-facing surface
+   * (ticket #7's localhost page) can call once it exists. There is
+   * deliberately no separate "approvals store" table — the plan token
+   * itself, already the unit `execute_plan` is scoped to, carries the
+   * approval flag; see TokenEntry.approved in this file.
+   *
+   * Idempotent: approving an already-approved (or never-gated) token
+   * succeeds without error. Does not consume the token or touch the
+   * database beyond writing the audit row — execute_plan still performs its
+   * own statement/fingerprint/expiry/rowset checks afterward.
+   */
+  async approvePlan(planToken: string, approvedBy: string | null = null): Promise<void> {
+    const startedAt = Date.now();
+    const result = this.store.approve(planToken);
+    const meta: TokenMeta =
+      result.meta ?? { tool: "approve_plan", reason: null, callerId: this.callerId, previewRows: NaN };
+    const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
+
+    if (!result.ok) {
+      await this.auditLog.record({
+        tool: meta.tool,
+        reason: meta.reason,
+        statement: "",
+        params: [],
+        previewRows,
+        actualRows: null,
+        planToken,
+        approvedBy,
+        status: "failed",
+        durationMs: Date.now() - startedAt,
+        callerId: meta.callerId,
+      });
+      throw result.error;
+    }
+
+    await this.auditLog.record({
+      tool: meta.tool,
+      reason: meta.reason,
+      statement: "",
+      params: [],
+      previewRows,
+      actualRows: null,
+      planToken,
+      approvedBy: approvedBy ?? "unknown",
+      status: "approved",
+      durationMs: Date.now() - startedAt,
+      callerId: meta.callerId,
+    });
   }
 
   private previewSql(statement: string): string {

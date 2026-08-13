@@ -15,7 +15,9 @@
   },
   "write": {
     "planTtlMs": 60000,
-    "statementTimeoutMs": 10000
+    "statementTimeoutMs": 10000,
+    "approvalRequiredAboveRows": 100,
+    "hardMaxRows": 10000
   },
   "callerId": "unknown"
 }

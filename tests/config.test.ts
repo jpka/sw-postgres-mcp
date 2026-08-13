@@ -187,3 +187,79 @@ describe("write timing config", () => {
     }
   });
 });
+
+describe("approval threshold / hard cap config (ticket #6)", () => {
+  it("defaults approvalRequiredAboveRows to 100 and hardMaxRows to 10_000", () => {
+    const config = loadConfig(writeTempConfig({}));
+    expect(config.write.approvalRequiredAboveRows).toBe(100);
+    expect(config.write.hardMaxRows).toBe(10_000);
+    expect(DEFAULT_WRITE_CONFIG.approvalRequiredAboveRows).toBe(100);
+    expect(DEFAULT_WRITE_CONFIG.hardMaxRows).toBe(10_000);
+  });
+
+  it("accepts positive integer overrides from the config file", () => {
+    const config = loadConfig(
+      writeTempConfig({
+        write: { approvalRequiredAboveRows: 25, hardMaxRows: 500 },
+      }),
+    );
+    expect(config.write.approvalRequiredAboveRows).toBe(25);
+    expect(config.write.hardMaxRows).toBe(500);
+  });
+
+  it("accepts positive values from environment overrides", () => {
+    const prevRo = process.env.DATABASE_URL_READONLY;
+    const prevWr = process.env.DATABASE_URL_WRITER;
+    try {
+      process.env.DATABASE_URL_READONLY = "postgres://ro:ro@localhost/db";
+      process.env.DATABASE_URL_WRITER = "postgres://rw:rw@localhost/db";
+      process.env.SW_APPROVAL_REQUIRED_ABOVE_ROWS = "42";
+      process.env.SW_HARD_MAX_ROWS = "4200";
+      const config = loadConfig();
+      expect(config.write.approvalRequiredAboveRows).toBe(42);
+      expect(config.write.hardMaxRows).toBe(4200);
+    } finally {
+      delete process.env.SW_APPROVAL_REQUIRED_ABOVE_ROWS;
+      delete process.env.SW_HARD_MAX_ROWS;
+      if (prevRo === undefined) delete process.env.DATABASE_URL_READONLY;
+      else process.env.DATABASE_URL_READONLY = prevRo;
+      if (prevWr === undefined) delete process.env.DATABASE_URL_WRITER;
+      else process.env.DATABASE_URL_WRITER = prevWr;
+    }
+  });
+
+  it("rejects zero, negative, or non-integer values for either threshold", () => {
+    expect(() =>
+      loadConfig(writeTempConfig({ write: { approvalRequiredAboveRows: 0 } })),
+    ).toThrow(/approvalRequiredAboveRows/);
+    expect(() =>
+      loadConfig(writeTempConfig({ write: { approvalRequiredAboveRows: -1 } })),
+    ).toThrow(/approvalRequiredAboveRows/);
+    expect(() =>
+      loadConfig(writeTempConfig({ write: { hardMaxRows: 1.5 } })),
+    ).toThrow(/hardMaxRows/);
+    expect(() =>
+      loadConfig(writeTempConfig({ write: { hardMaxRows: "abc" } })),
+    ).toThrow(/hardMaxRows/);
+  });
+
+  it("rejects a hardMaxRows lower than approvalRequiredAboveRows", () => {
+    expect(() =>
+      loadConfig(
+        writeTempConfig({
+          write: { approvalRequiredAboveRows: 500, hardMaxRows: 100 },
+        }),
+      ),
+    ).toThrow(/hardMaxRows.*approvalRequiredAboveRows/);
+  });
+
+  it("allows hardMaxRows equal to approvalRequiredAboveRows", () => {
+    const config = loadConfig(
+      writeTempConfig({
+        write: { approvalRequiredAboveRows: 100, hardMaxRows: 100 },
+      }),
+    );
+    expect(config.write.approvalRequiredAboveRows).toBe(100);
+    expect(config.write.hardMaxRows).toBe(100);
+  });
+});

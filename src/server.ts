@@ -49,6 +49,16 @@ const executePlanSchema = z.object({
   params: z.array(z.unknown()).optional(),
 });
 
+const approvePlanSchema = z
+  .object({
+    plan_token: z.string(),
+    // Who is approving this plan. Optional so a minimal/programmatic caller
+    // (this ticket only builds the mechanism) isn't blocked; recorded as
+    // "unknown" when omitted, same fallback as config.callerId.
+    approved_by: z.string().min(1).optional(),
+  })
+  .strict();
+
 function text(content: string) {
   return { content: [{ type: "text", text: content }] as const };
 }
@@ -116,6 +126,8 @@ export function createServer(pools: Pools, config: AppConfig): Server {
     pool: pools.writerPool,
     planTtlMs: config.write.planTtlMs,
     statementTimeoutMs: config.write.statementTimeoutMs,
+    approvalRequiredAboveRows: config.write.approvalRequiredAboveRows,
+    hardMaxRows: config.write.hardMaxRows,
     callerId: config.callerId,
   });
 
@@ -209,7 +221,7 @@ export function createServer(pools: Pools, config: AppConfig): Server {
       {
         name: "execute_plan",
         description:
-          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the delete_rows preview. The token is single-use, expires, refuses any statement that does not match the preview, and refuses to commit if the affected row set changed since the preview.",
+          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the delete_rows preview. The token is single-use, expires, refuses any statement that does not match the preview, refuses to commit if the affected row set changed since the preview, and — if the preview's affected-row count was above write.approvalRequiredAboveRows — refuses until approve_plan has approved it.",
         inputSchema: {
           type: "object",
           properties: {
@@ -228,6 +240,26 @@ export function createServer(pools: Pools, config: AppConfig): Server {
             },
           },
           required: ["plan_token", "statement"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "approve_plan",
+        description:
+          "Approve a plan token that is awaiting_approval (its preview's affected-row count was above write.approvalRequiredAboveRows), so execute_plan will honour it. This is the minimal internal/programmatic approval mechanism; a human-facing approval surface is expected to call this same tool rather than duplicate its logic. Idempotent — approving an already-approved or never-gated token succeeds without error.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            plan_token: {
+              type: "string",
+              description: "The token returned by the preview to approve.",
+            },
+            approved_by: {
+              type: "string",
+              description: "Identity of the approver, recorded in the audit log. Defaults to \"unknown\" if omitted.",
+            },
+          },
+          required: ["plan_token"],
           additionalProperties: false,
         },
       },
@@ -276,16 +308,38 @@ export function createServer(pools: Pools, config: AppConfig): Server {
       if (!parsed.success) return invalidArguments(parsed.error);
       try {
         const preview = await previewDeleteRows(write, config, parsed.data);
+        const message =
+          preview.status === "awaiting_approval"
+            ? `This plan affects ${preview.affectedRows} rows, above the approval threshold of ${config.write.approvalRequiredAboveRows}. It must be approved (approve_plan) before execute_plan will succeed — wait for approval, or narrow the statement and re-preview.`
+            : null;
         return text(
           JSON.stringify(
             {
-              status: "previewed",
+              status: preview.status,
               plan_token: preview.planToken,
               statement: preview.statement,
               params: preview.params,
               affected_rows: preview.affectedRows,
               sample_rows: preview.sampleRows,
+              message,
             },
+            null,
+            2,
+          ),
+        );
+      } catch (err) {
+        return errorBody(err);
+      }
+    }
+
+    if (name === "approve_plan") {
+      const parsed = approvePlanSchema.safeParse(args);
+      if (!parsed.success) return invalidArguments(parsed.error);
+      try {
+        await write.approvePlan(parsed.data.plan_token, parsed.data.approved_by ?? null);
+        return text(
+          JSON.stringify(
+            { status: "approved", plan_token: parsed.data.plan_token },
             null,
             2,
           ),

@@ -49,16 +49,6 @@ const executePlanSchema = z.object({
   params: z.array(z.unknown()).optional(),
 });
 
-const approvePlanSchema = z
-  .object({
-    plan_token: z.string(),
-    // Who is approving this plan. Optional so a minimal/programmatic caller
-    // (this ticket only builds the mechanism) isn't blocked; recorded as
-    // "unknown" when omitted, same fallback as config.callerId.
-    approved_by: z.string().min(1).optional(),
-  })
-  .strict();
-
 function text(content: string) {
   return { content: [{ type: "text", text: content }] as const };
 }
@@ -109,7 +99,26 @@ function invalidArguments(error: z.ZodError) {
   };
 }
 
-export function createServer(pools: Pools, config: AppConfig): Server {
+/**
+ * `write` is optional and defaults to a fresh `TwoPhaseWrite` bound to
+ * `pools.writerPool` — the normal path for `startServer`. Tests that need to
+ * call `TwoPhaseWrite.approvePlan()` directly (it is deliberately NOT exposed
+ * as an MCP tool — see the note on the tool list below) can construct their
+ * own instance and pass it in here so it shares the in-memory plan-token
+ * store with the server the MCP client talks to.
+ */
+export function createServer(
+  pools: Pools,
+  config: AppConfig,
+  write: TwoPhaseWrite = new TwoPhaseWrite({
+    pool: pools.writerPool,
+    planTtlMs: config.write.planTtlMs,
+    statementTimeoutMs: config.write.statementTimeoutMs,
+    approvalRequiredAboveRows: config.write.approvalRequiredAboveRows,
+    hardMaxRows: config.write.hardMaxRows,
+    callerId: config.callerId,
+  }),
+): Server {
   const server = new Server(
     {
       name: "sw-postgres-mcp",
@@ -121,15 +130,6 @@ export function createServer(pools: Pools, config: AppConfig): Server {
       },
     },
   );
-
-  const write = new TwoPhaseWrite({
-    pool: pools.writerPool,
-    planTtlMs: config.write.planTtlMs,
-    statementTimeoutMs: config.write.statementTimeoutMs,
-    approvalRequiredAboveRows: config.write.approvalRequiredAboveRows,
-    hardMaxRows: config.write.hardMaxRows,
-    callerId: config.callerId,
-  });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
@@ -221,7 +221,7 @@ export function createServer(pools: Pools, config: AppConfig): Server {
       {
         name: "execute_plan",
         description:
-          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the delete_rows preview. The token is single-use, expires, refuses any statement that does not match the preview, refuses to commit if the affected row set changed since the preview, and — if the preview's affected-row count was above write.approvalRequiredAboveRows — refuses until approve_plan has approved it.",
+          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the delete_rows preview. The token is single-use, expires, refuses any statement that does not match the preview, refuses to commit if the affected row set changed since the preview, and — if the preview's affected-row count was above write.approvalRequiredAboveRows — refuses until a human approves it through an out-of-band approval surface (not available through this MCP tool set).",
         inputSchema: {
           type: "object",
           properties: {
@@ -243,26 +243,13 @@ export function createServer(pools: Pools, config: AppConfig): Server {
           additionalProperties: false,
         },
       },
-      {
-        name: "approve_plan",
-        description:
-          "Approve a plan token that is awaiting_approval (its preview's affected-row count was above write.approvalRequiredAboveRows), so execute_plan will honour it. This is the minimal internal/programmatic approval mechanism; a human-facing approval surface is expected to call this same tool rather than duplicate its logic. Idempotent — approving an already-approved or never-gated token succeeds without error.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            plan_token: {
-              type: "string",
-              description: "The token returned by the preview to approve.",
-            },
-            approved_by: {
-              type: "string",
-              description: "Identity of the approver, recorded in the audit log. Defaults to \"unknown\" if omitted.",
-            },
-          },
-          required: ["plan_token"],
-          additionalProperties: false,
-        },
-      },
+      // Deliberately no `approve_plan` tool here: approval must come from an
+      // independently authenticated human principal, not from the same
+      // agent session that requested the gated write (see DECISIONS.md).
+      // `TwoPhaseWrite.approvePlan()` still exists in src/writeCore.ts as an
+      // internal method for the future localhost human-approval surface
+      // (#7) to call directly — it is intentionally not reachable through
+      // this MCP tool surface.
     ],
   }));
 
@@ -310,7 +297,7 @@ export function createServer(pools: Pools, config: AppConfig): Server {
         const preview = await previewDeleteRows(write, config, parsed.data);
         const message =
           preview.status === "awaiting_approval"
-            ? `This plan affects ${preview.affectedRows} rows, above the approval threshold of ${config.write.approvalRequiredAboveRows}. It must be approved (approve_plan) before execute_plan will succeed — wait for approval, or narrow the statement and re-preview.`
+            ? `This plan affects ${preview.affectedRows} rows, above the approval threshold of ${config.write.approvalRequiredAboveRows}. It requires human approval through an out-of-band approval surface before execute_plan will succeed — wait for approval, or narrow the statement and re-preview.`
             : null;
         return text(
           JSON.stringify(
@@ -323,23 +310,6 @@ export function createServer(pools: Pools, config: AppConfig): Server {
               sample_rows: preview.sampleRows,
               message,
             },
-            null,
-            2,
-          ),
-        );
-      } catch (err) {
-        return errorBody(err);
-      }
-    }
-
-    if (name === "approve_plan") {
-      const parsed = approvePlanSchema.safeParse(args);
-      if (!parsed.success) return invalidArguments(parsed.error);
-      try {
-        await write.approvePlan(parsed.data.plan_token, parsed.data.approved_by ?? null);
-        return text(
-          JSON.stringify(
-            { status: "approved", plan_token: parsed.data.plan_token },
             null,
             2,
           ),

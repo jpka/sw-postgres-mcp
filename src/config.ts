@@ -27,8 +27,8 @@ export interface WriteConfig {
    * A preview whose exact rollback-preview affected-row count is at or below
    * this threshold returns a token `execute_plan` will honour immediately.
    * Above it, the preview returns `status: "awaiting_approval"` instead — the
-   * token exists but `execute_plan` refuses it until `approve_plan` marks it
-   * approved. Default 100.
+   * token exists but `execute_plan` refuses it until `TwoPhaseWrite.approvePlan()`
+   * marks it approved (deliberately not an agent-facing MCP tool). Default 100.
    */
   approvalRequiredAboveRows: number;
   /**

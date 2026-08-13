@@ -29,13 +29,21 @@ contract #7 can build on, rather than a placeholder #7 has to redesign?
   `execute_plan` refuses with `AWAITING_APPROVAL` while `requiresApproval && !approved`.
 - `TwoPhaseWrite.approvePlan(planToken, approvedBy)` is the entire approval mechanism:
   it looks up the token, flips `approved = true`, and writes an `approved` audit row
-  (`approved_by` = the caller-supplied identity, default `"unknown"`). It does not
-  consume the token — `execute_plan` still runs its own statement/fingerprint/expiry/
-  rowset checks afterward, unchanged. It is idempotent (approving twice, or approving a
-  token that never required approval, both just succeed).
-- Exposed today as the `approve_plan` MCP tool (`plan_token`, optional `approved_by`) —
-  a real, callable mechanism, not a stub, so it can be exercised by tests and by hand
-  before any UI exists.
+  (`tool` set explicitly to `"approve_plan"`; `approved_by` = the caller-supplied
+  identity, default `"unknown"`). It does not consume the token — `execute_plan` still
+  runs its own statement/fingerprint/expiry/rowset checks afterward, unchanged. It is
+  idempotent (approving twice, or approving a token that never required approval, both
+  just succeed).
+- **Deliberately NOT exposed as an MCP tool.** `approve_plan` is a real, callable,
+  internal/programmatic method — not a stub — so it can be exercised by tests and (once
+  #7 exists) by a human, but it is not on the agent-facing MCP server's tool list. The
+  whole point of `awaiting_approval` is a human-in-the-loop gate; if the same MCP
+  connection an agent uses to request a gated write could also call `approve_plan`, the
+  gate would be theater — the requesting agent could preview a write, "approve" its own
+  plan with a self-reported `approved_by`, and execute it, with nothing to stop it. So
+  `approvePlan` is exported from `TwoPhaseWrite` for #7's out-of-band localhost approval
+  page (see the 2026-08-12 entry below) to call directly, and is exercised in tests the
+  same way — never through the MCP tool-dispatch layer.
 - A row over `hardMaxRows` never reaches any of the above: no token is created at all
   (`HARD_MAX_ROWS_EXCEEDED`, audited as `hard_cap_refused`). There is nothing for an
   approval mechanism to act on in that case by design — the ticket's "wall, not a gate."
@@ -80,11 +88,14 @@ not the thing `execute_plan` checks live.
 ### For #7
 
 Two front-ends over one mechanism, same framing as the 2026-08-12 entry below:
-`approve_plan` (this ticket) is the whole "approve" button's backend already. #7 mainly
-needs to add (a) a way to list pending (`awaiting_approval`, unexpired, unused) plans,
-and (b) a symmetric `reject_plan` that deletes the token instead of approving it and
-returns a rejection `execute_plan` can distinguish from `AWAITING_APPROVAL` /
-`EXPIRED_TOKEN` / `USED_TOKEN` (its own new `WriteErrorCode`, e.g. `PLAN_REJECTED`).
+`TwoPhaseWrite.approvePlan()` (this ticket) is the whole "approve" button's backend
+already — #7's localhost page calls it directly (it is not, and must not become, an MCP
+tool the agent itself can reach). #7 mainly needs to add (a) a way to list pending
+(`awaiting_approval`, unexpired, unused) plans, and (b) a symmetric `rejectPlan` that
+deletes the token instead of approving it and returns a rejection `execute_plan` can
+distinguish from `AWAITING_APPROVAL` / `EXPIRED_TOKEN` / `USED_TOKEN` (its own new
+`WriteErrorCode`, e.g. `PLAN_REJECTED`) — likewise called directly by #7's page, not
+exposed as `reject_plan` on the MCP server.
 
 ---
 

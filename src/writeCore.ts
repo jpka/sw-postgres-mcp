@@ -260,13 +260,14 @@ class TokenStore {
     }
     if (entry.requiresApproval && !entry.approved) {
       // Deliberately does not delete or mark the token used: it stays
-      // pending so a later approve_plan + execute_plan can still succeed.
+      // pending so a later TwoPhaseWrite.approvePlan() + execute_plan can
+      // still succeed.
       return {
         ok: false,
         error: new WriteError(
           "AWAITING_APPROVAL",
           "This plan affected more rows than the approval threshold allows and has not been approved yet.",
-          "Ask a human to approve this plan (approve_plan), or narrow the statement and re-preview to stay under the threshold.",
+          "This requires approval through an out-of-band human approval process — it cannot be approved by this agent. Wait for approval, or narrow the statement and re-preview to stay under the threshold.",
         ),
         meta,
       };
@@ -534,9 +535,10 @@ export class TwoPhaseWrite {
   /**
    * Marks a plan token approved so `execute_plan` will honour it despite
    * `AWAITING_APPROVAL`. This is the whole approval mechanism ticket #6
-   * builds: an internal/programmatic entry point (also exposed as the
-   * `approve_plan` MCP tool in server.ts) that a later human-facing surface
-   * (ticket #7's localhost page) can call once it exists. There is
+   * builds: an internal/programmatic entry point that is deliberately NOT
+   * exposed as an MCP tool (see src/server.ts) — the requesting agent must
+   * not be able to approve its own gated plan. Ticket #7's localhost human
+   * approval page is expected to call this method directly. There is
    * deliberately no separate "approvals store" table — the plan token
    * itself, already the unit `execute_plan` is scoped to, carries the
    * approval flag; see TokenEntry.approved in this file.
@@ -571,7 +573,7 @@ export class TwoPhaseWrite {
     }
 
     await this.auditLog.record({
-      tool: meta.tool,
+      tool: "approve_plan",
       reason: meta.reason,
       statement: "",
       params: [],

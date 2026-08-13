@@ -67,6 +67,12 @@ async function auditRowsForReason(reason: string): Promise<Record<string, unknow
 describe("approval threshold, hard row cap, and awaiting_approval (#6)", () => {
   let client: Client;
   let serverPools: ReturnType<typeof createPools>;
+  // approve_plan is deliberately NOT an MCP tool (the requesting agent must
+  // not be able to approve its own gated plan — see src/server.ts and
+  // DECISIONS.md). Tests that need to approve a plan call this same
+  // TwoPhaseWrite instance's approvePlan() directly, the way ticket #7's
+  // human approval surface will, instead of going through the MCP client.
+  let write: TwoPhaseWrite;
 
   beforeAll(async () => {
     await waitForDb(SUPERUSER_URL);
@@ -89,7 +95,15 @@ describe("approval threshold, hard row cap, and awaiting_approval (#6)", () => {
     };
 
     serverPools = createPools(config);
-    const server = createServer(serverPools, config);
+    write = new TwoPhaseWrite({
+      pool: serverPools.writerPool,
+      planTtlMs: config.write.planTtlMs,
+      statementTimeoutMs: config.write.statementTimeoutMs,
+      approvalRequiredAboveRows: config.write.approvalRequiredAboveRows,
+      hardMaxRows: config.write.hardMaxRows,
+      callerId: config.callerId,
+    });
+    const server = createServer(serverPools, config, write);
 
     client = new Client({ name: "test-client", version: "0.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -168,7 +182,7 @@ describe("approval threshold, hard row cap, and awaiting_approval (#6)", () => {
     expect(rows[1].plan_token).toBe(body.plan_token);
   });
 
-  it("AC3: once approved via approve_plan, execute_plan succeeds", async () => {
+  it("AC3: once approved via TwoPhaseWrite.approvePlan(), execute_plan succeeds", async () => {
     const reason = `approved-then-exec-${randomUUID()}`;
     const preview = await client.callTool({
       name: "delete_rows",
@@ -177,13 +191,12 @@ describe("approval threshold, hard row cap, and awaiting_approval (#6)", () => {
     const { body } = parseToolResult(preview as never);
     expect(body.status).toBe("awaiting_approval");
 
-    const approve = await client.callTool({
-      name: "approve_plan",
-      arguments: { plan_token: body.plan_token, approved_by: "reviewer@example.com" },
-    });
-    const approveParsed = parseToolResult(approve as never);
-    expect(approveParsed.isError).toBe(false);
-    expect(approveParsed.body.status).toBe("approved");
+    // approve_plan is not an MCP tool (see beforeAll comment above) — approve
+    // through the shared TwoPhaseWrite instance directly, as the future
+    // human approval surface (#7) will.
+    await expect(
+      write.approvePlan(body.plan_token as string, "reviewer@example.com"),
+    ).resolves.toBeUndefined();
 
     const exec = await client.callTool({
       name: "execute_plan",
@@ -215,11 +228,9 @@ describe("approval threshold, hard row cap, and awaiting_approval (#6)", () => {
     const { body } = parseToolResult(preview as never);
     expect(body.status).toBe("previewed");
 
-    const approve = await client.callTool({
-      name: "approve_plan",
-      arguments: { plan_token: body.plan_token },
-    });
-    expect(parseToolResult(approve as never).isError).toBe(false);
+    await expect(
+      write.approvePlan(body.plan_token as string),
+    ).resolves.toBeUndefined();
 
     const exec = await client.callTool({
       name: "execute_plan",
@@ -262,13 +273,10 @@ describe("approval threshold, hard row cap, and awaiting_approval (#6)", () => {
 
     // Even attempting to approve a plausible-looking token is refused as unknown;
     // there is no plan floating around that a human could mistakenly approve.
-    const approve = await client.callTool({
-      name: "approve_plan",
-      arguments: { plan_token: "not-a-real-token" },
+    // approve_plan is not an MCP tool, so this goes through TwoPhaseWrite directly.
+    await expect(write.approvePlan("not-a-real-token")).rejects.toMatchObject({
+      code: "UNKNOWN_TOKEN",
     });
-    const approveParsed = parseToolResult(approve as never);
-    expect(approveParsed.isError).toBe(true);
-    expect(approveParsed.body.code).toBe("UNKNOWN_TOKEN");
   });
 
   it("AC7: both thresholds are independently configurable, not hardcoded", async () => {

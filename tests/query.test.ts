@@ -500,6 +500,36 @@ describe("query tool", () => {
     }
   });
 
+  it("Unicode-escaped identifiers are still allowlist-checked", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    await expect(
+      runQuery(
+        roPool,
+        { statement: 'SELECT * FROM U&"t3q_secret_tokens"', reason: "test" },
+        config,
+      ),
+    ).rejects.toMatchObject({
+      code: "TABLE_NOT_ALLOWLISTED",
+      message: "Table public.t3q_secret_tokens is not in the read allowlist.",
+    });
+  });
+
+  it("Unicode-escaped identifiers resolve to the allowlisted table they name", async () => {
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_secret_tokens"] },
+    });
+    const result = await runQuery(
+      roPool,
+      { statement: 'SELECT * FROM U&"t3q_secret_tokens"', limit: 1, reason: "test" },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+    expect(result.rows[0].token).toBe("shh");
+  });
+
   it("refuses a mutating statement with a structured error before hitting the database", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

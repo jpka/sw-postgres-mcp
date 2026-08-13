@@ -213,18 +213,73 @@ function readRelation(
   sql: string,
   start: number,
 ): { ref: string; end: number } | null {
-  const first = readWord(sql, start);
+  const first = readRelationPart(sql, start);
   if (!first) return null;
   const parts = [first.raw];
   let pos = skipWs(sql, first.end);
   if (sql[pos] === ".") {
-    const second = readWord(sql, skipWs(sql, pos + 1));
+    const second = readRelationPart(sql, skipWs(sql, pos + 1));
     if (second) {
       parts.push(second.raw);
       pos = skipWs(sql, second.end);
     }
   }
   return { ref: parts.join("."), end: pos };
+}
+
+/**
+ * Read one part of a relation (schema or table name): either a plain quoted or
+ * unquoted word, or a PostgreSQL `U&"..."` Unicode-escaped identifier, whose
+ * `\XXXX` / `\+XXXXXX` escapes are decoded so the allowlist resolver sees the
+ * real name (an un-decoded `U&"t"` was previously read as just `U`).
+ */
+function readRelationPart(
+  sql: string,
+  start: number,
+): { raw: string; end: number } | null {
+  if (sql[start] === "U" || sql[start] === "u") {
+    if (sql[start + 1] === "&" && sql[start + 2] === '"') {
+      const uni = readUnicodeIdentifier(sql, start);
+      if (uni) return { raw: uni.ref, end: uni.end };
+    }
+  }
+  return readWord(sql, start);
+}
+
+/** Decode a `U&"..."` identifier (default `\` escape char) and quote the result. */
+function readUnicodeIdentifier(
+  sql: string,
+  start: number,
+): { ref: string; end: number } | null {
+  let i = start + 3;
+  let name = "";
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === "\\") {
+      const plus = sql[i + 1] === "+";
+      const digits = plus ? 6 : 4;
+      const hex = sql.slice(i + (plus ? 2 : 1), i + (plus ? 2 : 1) + digits);
+      if (/^(?:[0-9A-Fa-f]{4}|[0-9A-Fa-f]{6})$/.test(hex)) {
+        name += String.fromCodePoint(parseInt(hex, 16));
+        i += (plus ? 2 : 1) + digits;
+        continue;
+      }
+      name += ch;
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      if (sql[i + 1] === '"') {
+        name += '"';
+        i += 2;
+        continue;
+      }
+      return { ref: `"${name.replace(/"/g, '""')}"`, end: i + 1 };
+    }
+    name += ch;
+    i++;
+  }
+  return null;
 }
 
 /** Index just past the `)` that closes the group opened at `open`, or -1. */

@@ -471,6 +471,35 @@ describe("query tool", () => {
     });
   });
 
+  it("quoted table name with parentheses inside a parenthesized join group is still allowlist-checked", async () => {
+    await withSuperuser(async (c) => {
+      await c.query(`DROP TABLE IF EXISTS "t3q_excluded(parens)"`);
+      await c.query(`CREATE TABLE "t3q_excluded(parens)" (id INT, secret TEXT)`);
+      await c.query(`INSERT INTO "t3q_excluded(parens)" (id, secret) VALUES (1, 'blocked')`);
+      await c.query(`GRANT SELECT ON "t3q_excluded(parens)" TO readonly`);
+    });
+
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_customers"] },
+    });
+    try {
+      await expect(
+        runQuery(
+          roPool,
+          { statement: 'SELECT * FROM ("t3q_excluded(parens)" e JOIN t3q_customers c ON e.id = c.id)', reason: "test" },
+          config,
+        ),
+      ).rejects.toMatchObject({
+        code: "TABLE_NOT_ALLOWLISTED",
+        message: 'Table public.t3q_excluded(parens) is not in the read allowlist.',
+      });
+    } finally {
+      await withSuperuser(async (c) => {
+        await c.query(`DROP TABLE IF EXISTS "t3q_excluded(parens)"`);
+      });
+    }
+  });
+
   it("quoted mixed-case relations are still allowlist-checked", async () => {
     await withSuperuser(async (c) => {
       await c.query(`DROP TABLE IF EXISTS "t3q_SecretTokens"`);

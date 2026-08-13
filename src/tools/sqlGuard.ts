@@ -319,8 +319,43 @@ function readUnicodeIdentifier(
 function matchingParen(sql: string, open: number): number {
   let depth = 0;
   for (let j = open; j < sql.length; j++) {
-    if (sql[j] === "(") depth++;
-    else if (sql[j] === ")") {
+    const ch = sql[j];
+    if (ch === '"') {
+      j++;
+      while (j < sql.length) {
+        if (sql[j] === '"') {
+          if (sql[j + 1] === '"') {
+            j += 2;
+            continue;
+          }
+          j++;
+          break;
+        }
+        j++;
+      }
+      continue;
+    }
+    if (ch === "U" || ch === "u") {
+      if (sql[j + 1] === "&" && sql[j + 2] === '"') {
+        j += 3;
+        while (j < sql.length) {
+          if (sql[j] === '"') {
+            if (sql[j + 1] === '"') {
+              j += 2;
+              continue;
+            }
+            j++;
+            break;
+          }
+          j++;
+        }
+        const ues = /^\s*UESCAPE\s+'([^']*)'/i.exec(sql.slice(j));
+        if (ues) j += ues[0].length;
+        continue;
+      }
+    }
+    if (ch === "(") depth++;
+    else if (ch === ")") {
       depth--;
       if (depth === 0) return j;
     }

@@ -58,5 +58,8 @@ export async function previewDeleteRows(
   const statement = `DELETE FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)}${
     where ? ` WHERE ${where}` : ""
   }`;
-  return write.preview(statement, input.params ?? []);
+  return write.preview(statement, input.params ?? [], {
+    tool: "delete_rows",
+    reason: input.reason ?? null,
+  });
 }

@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
+import { AuditLog } from "./auditLog.js";
 
 export type WriteErrorCode =
   | "UNKNOWN_TOKEN"
@@ -42,9 +43,28 @@ export interface TwoPhaseWriteOptions {
   pool: pg.Pool;
   planTtlMs: number;
   statementTimeoutMs: number;
+  /** Identity recorded as `caller_id` on every audit row this instance writes. Default "unknown". */
+  callerId?: string;
+  /** Audit sink. Defaults to an `AuditLog` writing through `pool` (the writer role). */
+  auditLog?: AuditLog;
 }
 
-interface TokenEntry {
+/** Per-call context recorded onto the audit trail. `tool` names the MCP tool driving this preview. */
+export interface WriteMeta {
+  tool: string;
+  reason?: string | null;
+}
+
+const DEFAULT_WRITE_META: WriteMeta = { tool: "unknown_tool" };
+
+interface TokenMeta {
+  tool: string;
+  reason: string | null;
+  callerId: string;
+  previewRows: number;
+}
+
+interface TokenEntry extends TokenMeta {
   fingerprint: string;
   rowsDigest: string;
   expiresAt: number;
@@ -69,12 +89,16 @@ export function statementFingerprint(
     .digest("hex");
 }
 
+type ConsumeResult =
+  | { ok: true; rowsDigest: string; meta: TokenMeta }
+  | { ok: false; error: WriteError; meta?: TokenMeta };
+
 class TokenStore {
   private tokens = new Map<string, TokenEntry>();
 
   constructor(private ttlMs: number) {}
 
-  create(fingerprint: string, rowsDigest: string): string {
+  create(fingerprint: string, rowsDigest: string, meta: TokenMeta): string {
     this.prune();
     const token = randomBytes(24).toString("hex");
     this.tokens.set(token, {
@@ -82,15 +106,25 @@ class TokenStore {
       rowsDigest,
       expiresAt: Date.now() + this.ttlMs,
       used: false,
+      ...meta,
     });
     return token;
   }
 
-  consume(
-    token: string,
-    fingerprint: string,
-  ): { ok: true; rowsDigest: string } | { ok: false; error: WriteError } {
+  consume(token: string, fingerprint: string): ConsumeResult {
     const entry = this.tokens.get(token);
+    // Captured before any mutation below, so a failure path can still audit
+    // *what* was being executed (tool, reason, caller) even though the token
+    // itself is about to be deleted or was never valid to begin with.
+    const meta: TokenMeta | undefined = entry
+      ? {
+          tool: entry.tool,
+          reason: entry.reason,
+          callerId: entry.callerId,
+          previewRows: entry.previewRows,
+        }
+      : undefined;
+
     if (!entry) {
       return {
         ok: false,
@@ -108,6 +142,7 @@ class TokenStore {
           "USED_TOKEN",
           "This plan token was already used. A plan token can only be executed once.",
         ),
+        meta,
       };
     }
     if (Date.now() > entry.expiresAt) {
@@ -118,6 +153,7 @@ class TokenStore {
           "EXPIRED_TOKEN",
           "This plan token has expired. Re-run the write to obtain a fresh preview and token.",
         ),
+        meta,
       };
     }
     if (entry.fingerprint !== fingerprint) {
@@ -128,10 +164,11 @@ class TokenStore {
           "The statement or parameters do not match the plan the token was issued for.",
           "Pass the exact statement and params from the preview response.",
         ),
+        meta,
       };
     }
     entry.used = true;
-    return { ok: true, rowsDigest: entry.rowsDigest };
+    return { ok: true, rowsDigest: entry.rowsDigest, meta: meta! };
   }
 
   private prune(): void {
@@ -161,15 +198,22 @@ class TokenStore {
  */
 export class TwoPhaseWrite {
   private store: TokenStore;
+  private auditLog: AuditLog;
+  private callerId: string;
 
   constructor(private opts: TwoPhaseWriteOptions) {
     this.store = new TokenStore(opts.planTtlMs);
+    this.auditLog = opts.auditLog ?? new AuditLog(opts.pool);
+    this.callerId = opts.callerId ?? "unknown";
   }
 
   async preview(
     statement: string,
     params: readonly unknown[],
+    meta: WriteMeta = DEFAULT_WRITE_META,
   ): Promise<WritePreview> {
+    const startedAt = Date.now();
+    const reason = meta.reason ?? null;
     const client = await this.opts.pool.connect();
     try {
       await client.query(`SET statement_timeout = ${this.opts.statementTimeoutMs}`);
@@ -190,11 +234,50 @@ export class TwoPhaseWrite {
       const planToken = this.store.create(
         statementFingerprint(statement, params),
         row.rows_digest,
+        { tool: meta.tool, reason, callerId: this.callerId, previewRows: affectedRows },
       );
+
+      // Recorded on the same connection, after ROLLBACK has ended the preview
+      // transaction, so the audit row survives the rollback that undoes the
+      // preview itself.
+      await this.auditLog.record(
+        {
+          tool: meta.tool,
+          reason,
+          statement,
+          params,
+          previewRows: affectedRows,
+          actualRows: null,
+          planToken,
+          approvedBy: null,
+          status: "previewed",
+          durationMs: Date.now() - startedAt,
+          callerId: this.callerId,
+        },
+        client,
+      );
+
       return { planToken, affectedRows, sampleRows, statement, params };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
-      throw translateDbError(err);
+      const translated = translateDbError(err);
+      await this.auditLog.record(
+        {
+          tool: meta.tool,
+          reason,
+          statement,
+          params,
+          previewRows: null,
+          actualRows: null,
+          planToken: null,
+          approvedBy: null,
+          status: "failed",
+          durationMs: Date.now() - startedAt,
+          callerId: this.callerId,
+        },
+        client,
+      );
+      throw translated;
     } finally {
       client.release();
     }
@@ -205,9 +288,32 @@ export class TwoPhaseWrite {
     statement: string,
     params: readonly unknown[],
   ): Promise<ExecuteResult> {
+    const startedAt = Date.now();
     const fingerprint = statementFingerprint(statement, params);
     const consumed = this.store.consume(planToken, fingerprint);
-    if (!consumed.ok) throw consumed.error;
+    // A token that never existed (or expired before this call) has no stored
+    // meta to recover — fall back to generic attribution so the attempt is
+    // still audited rather than dropped.
+    const meta: TokenMeta =
+      consumed.meta ?? { tool: "execute_plan", reason: null, callerId: this.callerId, previewRows: NaN };
+    const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
+
+    if (!consumed.ok) {
+      await this.auditLog.record({
+        tool: meta.tool,
+        reason: meta.reason,
+        statement,
+        params,
+        previewRows,
+        actualRows: null,
+        planToken,
+        approvedBy: null,
+        status: "failed",
+        durationMs: Date.now() - startedAt,
+        callerId: meta.callerId,
+      });
+      throw consumed.error;
+    }
 
     const client = await this.opts.pool.connect();
     try {
@@ -219,7 +325,6 @@ export class TwoPhaseWrite {
         rows_digest: string;
       };
       if (row.rows_digest !== consumed.rowsDigest) {
-        await client.query("ROLLBACK").catch(() => {});
         throw new WriteError(
           "ROWSET_CHANGED",
           "The set of rows the statement would affect changed since the preview.",
@@ -227,10 +332,49 @@ export class TwoPhaseWrite {
         );
       }
       await client.query("COMMIT");
-      return { affectedRows: Number(row.affected_rows) };
+      const affectedRows = Number(row.affected_rows);
+
+      // Recorded after COMMIT, on the same connection (now back to
+      // autocommit), so a failure to write the audit row can never roll back
+      // a write that already succeeded.
+      await this.auditLog.record(
+        {
+          tool: meta.tool,
+          reason: meta.reason,
+          statement,
+          params,
+          previewRows,
+          actualRows: affectedRows,
+          planToken,
+          approvedBy: null,
+          status: "executed",
+          durationMs: Date.now() - startedAt,
+          callerId: meta.callerId,
+        },
+        client,
+      );
+
+      return { affectedRows };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
-      throw translateDbError(err);
+      const translated = translateDbError(err);
+      await this.auditLog.record(
+        {
+          tool: meta.tool,
+          reason: meta.reason,
+          statement,
+          params,
+          previewRows,
+          actualRows: null,
+          planToken,
+          approvedBy: null,
+          status: "failed",
+          durationMs: Date.now() - startedAt,
+          callerId: meta.callerId,
+        },
+        client,
+      );
+      throw translated;
     } finally {
       client.release();
     }

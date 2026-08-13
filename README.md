@@ -1,6 +1,60 @@
 # sw-postgres-mcp
 
-Safe-write Postgres MCP server — an agent can read and modify a database without being able to cause an unrecoverable accident.
+Safe-write Postgres MCP server — an agent can read and modify a database without being able to cause an unrecoverable accident. The differentiator is the safety layer, not the tool coverage: 8 MCP tools, 3 of them read-only, 4 write tools that only ever *preview* a change, and one `execute_plan` that commits a previewed change and nothing else.
+
+## Architecture
+
+```text
+ Claude (agent)
+      │  MCP stdio (tools/call)
+      ▼
+ sw-postgres-mcp
+ │
+ ├─ describe_schema / query / explain_plan ──► readonly pool ──► Postgres "readonly" role (SELECT only)
+ │
+ ├─ delete_rows / insert_rows / update_rows / run_migration
+ │     │
+ │     ▼
+ │  TwoPhaseWrite.preview()
+ │     BEGIN → run the real statement → ROLLBACK
+ │     DML (delete_rows/insert_rows/update_rows): capture exact RETURNING count + sample
+ │     DDL (run_migration): no RETURNING to capture — reports 0 affected rows, a `target`
+ │                           table/schema extracted from the statement text, and always
+ │                           goes to "awaiting_approval" regardless of that row count
+ │     └─► plan_token = sha256(statement + params)   ("statementFingerprint")
+ │           ├─ affected_rows ≤ approvalRequiredAboveRows  → status: "previewed"
+ │           ├─ affected_rows >  approvalRequiredAboveRows → status: "awaiting_approval"
+ │           └─ affected_rows >  hardMaxRows               → refused outright, no token issued
+ │           (run_migration ignores both thresholds — every DDL preview is "awaiting_approval")
+ │
+ ├─ execute_plan(plan_token, statement, params) ──► writer pool ──► Postgres "writer" role (DML + DDL)
+ │     re-derives the fingerprint from what was passed back and refuses on any mismatch
+ │     (STATEMENT_MISMATCH) or an affected-row-set that changed since preview (ROWSET_CHANGED)
+ │
+ └─ every preview / approval / execution / rejection / refusal ──► mcp_audit.log
+                                                                     (INSERT-only grant;
+                                                                      UPDATE/DELETE/TRUNCATE revoked
+                                                                      — see "Audit log" below)
+
+ an "awaiting_approval" plan surfaces at:
+ localhost approval UI — http://127.0.0.1:4319/  (bound to 127.0.0.1, human-only)
+   approve() / reject() are called directly on the shared TwoPhaseWrite instance —
+   never exposed as an MCP tool the agent itself can reach
+```
+
+Two Postgres connection pools, each authenticated as a distinct role (see [Threat model](#threat-model) below): `readonly` for `describe_schema`/`query`/`explain_plan`, `writer` for the four write-preview tools and `execute_plan`. All 4 write tools — `delete_rows`, `insert_rows`, `update_rows`, `run_migration` — share one core, `TwoPhaseWrite` (`src/writeCore.ts`): every one of them previews inside a transaction that always rolls back, then requires a separate `execute_plan` call with the exact plan token to actually commit. There is no 5th write tool and no tool that skips the preview step — `execute_plan` is the only thing in this server that commits anything, and it only ever replays a statement that was already previewed. See [Tools](#tools) below for what each tool takes and returns, and [Two-phase writes](#two-phase-writes) for the mechanics.
+
+## Threat model
+
+The risk here is **not SQL injection.** `delete_rows`, `insert_rows`, and `update_rows` take structured arguments — `table`, `where` + parameterized `params`, a `set` object — and every value in those structured inputs goes through `$n` placeholders, never string concatenation (see `update_rows`'s note on this in [Tools](#tools)). `run_migration` is different: DDL can't be parameterized the way DML values can, so it sends its raw agent-supplied statement directly to Postgres, the same way `query`/`explain_plan` already handle raw SQL — its safety comes not from parameterization but from always requiring human approval regardless of row count (see [Tools](#tools)), never from an `$n`-placeholder guarantee it doesn't have. The agent is the *author* of the SQL it sends, and it's a trusted-but-fallible author: it isn't trying to escape a quote, but it can absolutely produce a syntactically perfect, well-formed statement whose *scope* is the problem — `DELETE FROM users WHERE active = false` when 40,000 rows happen to match, or an `UPDATE` that silently drops its `WHERE` clause because the agent forgot one. That is the failure mode this project is built to survive, and three mechanisms carry the weight:
+
+**1. Preview-and-rollback, not `EXPLAIN`.** `EXPLAIN` only ever gives the Postgres planner's *estimate* of how many rows a statement will touch, derived from table statistics that can be stale (especially right after a bulk load, before `ANALYZE` has run) or simply wrong for a correlated predicate the planner can't model well. An approval gate built on an estimate is a gate an agent (or ordinary data skew) can defeat by accident, not just by malice — a statement whose *true* affected-row count is 40,000 could still sail under a threshold if the planner guessed 80. So every write tool here instead runs the real statement inside `BEGIN … ROLLBACK`: the row count in the preview is the exact count a real execution just produced, not a projection. `EXPLAIN` still has a job — the standalone `explain_plan` tool offers it as a cheap, side-effect-free pre-check an agent can call before ever attempting a two-phase write — but it is never what the approval thresholds compare against.
+
+**2. Role separation, not parsing.** `readonly` and `writer` are two distinct Postgres roles with distinct grants (`docker/init/01-roles.sql`): `readonly` has `SELECT` only (and `CREATE` explicitly revoked on its schema); `writer` has `SELECT, INSERT, UPDATE, DELETE`, gated further by this project's own write allowlist. A mutating statement submitted through the `readonly` pool is refused by Postgres itself with `permission denied` — verified against a live database in `tests/roles.test.ts`, not just asserted in code. The alternative — parsing or regex-matching SQL text to decide "is this a write?" — was deliberately not made the safety boundary: a parser can always be fooled by a form it wasn't written to catch (a CTE-wrapped `WITH x AS (DELETE FROM ... RETURNING *) SELECT * FROM x`, a mutating function call, a quoting edge case), and getting that wrong is a security hole, not a cosmetic bug. `query`/`explain_plan` do still reject non-`SELECT` statements and enforce the read allowlist by extracting table references from the statement text (`src/tools/sqlGuard.ts`) — but that is explicitly a second, defense-in-depth layer on top of the role grant, not the property itself. See `DECISIONS.md` for the full reasoning, including why a gap in that text-based allowlist parsing (which needed several hardening passes for quoted/Unicode-escaped identifiers) is a bounded allowlist-bypass risk rather than a "read tool executed a write" risk.
+
+**3. Plan tokens bind to a statement-hash fingerprint.** A plan token by itself — a random, opaque ID — would only prove "some preview happened at some point." It says nothing about *which* statement was previewed, which means a token alone can't stop a bait-and-switch: swap in a wider `WHERE` clause, a different table, extra rows, and hand the same-looking token to `execute_plan`. So every token is bound to `statementFingerprint(statement, params)` — a SHA-256 hash of the trimmed statement text plus the JSON-serialized parameter list — computed at preview time and re-derived from whatever `execute_plan` is actually called with; any mismatch is refused as `STATEMENT_MISMATCH` before anything runs. This is what makes a human's approval in the [localhost approval UI](#localhost-approval-ui) mean something: they're approving the *exact* statement and params they were shown, not a token that could later be replayed against different SQL. (A second, independent check — the rows-affected digest — separately catches the case where the *same* statement now matches a different row set because of concurrent activity; see [Two-phase writes](#two-phase-writes) below.)
+
+See [Limitations](#limitations) for what this model deliberately does not cover, and `DECISIONS.md` for the full write-up of each of these three decisions plus the approval-mechanism spike (#1).
 
 ## Quick start
 
@@ -231,3 +285,21 @@ REVOKE UPDATE, DELETE, TRUNCATE ON mcp_audit.log FROM writer;
 ```
 
 No bug in this server, and no SQL an agent could construct through the `writer` role, can rewrite or erase a row once it lands — Postgres refuses the `UPDATE`/`DELETE` outright with `permission denied`. This is asserted by a real test against Postgres (`tests/auditLog.test.ts`), not just documented. `readonly` gets `SELECT` only, so an operator can read the trail without being able to write to it.
+
+## Limitations
+
+Stated plainly, not hidden:
+
+- **A rollback undoes table writes, not external side effects.** A `delete_rows`/`insert_rows`/`update_rows`/`run_migration` preview really does roll back — but if a `BEFORE`/`AFTER` trigger on the affected table fires a `NOTIFY`, calls an external service, or writes through a foreign data wrapper (FDW) to another database, that side effect already happened and is **not** undone by the preview's `ROLLBACK`. Postgres transactions only ever guarantee the transactional table state comes back; they cannot retract a message already sent to something outside the database. If a table an agent can write to has such a trigger, treat the preview step itself as side-effecting, not as free.
+- **Rolled-back inserts (and previewed DDL) still consume sequence values.** Postgres sequences are not transactional, so a rolled-back `insert_rows` preview — or a rolled-back `CREATE TABLE ... GENERATED ... AS IDENTITY`-style DDL preview — permanently advances any `serial`/`identity` sequence the affected columns default from. This shows up as gaps in serial columns purely from previews, whether or not they were ever executed. Harmless (Postgres sequences never guaranteed gap-free values to begin with) but worth knowing about; see [Sequence values and rolled-back inserts](#sequence-values-and-rolled-back-inserts) above.
+- **The audit log's append-only guarantee is a property of the `writer` role's grants, not of this server's code**, and it only holds for connections that go through that role. `docker/init/02-audit-log.sql` grants `writer` `INSERT` only on `mcp_audit.log` and revokes `UPDATE`/`DELETE`/`TRUNCATE` — see [Audit log](#audit-log) above — but a **superuser connection is outside this model entirely**: a Postgres superuser, the table's owner, or any role holding (or grantable) `UPDATE`/`DELETE`/`TRUNCATE` on `mcp_audit.log` — via table ownership, direct grant, or `ALTER`/`GRANT` rights over the `writer` role itself — can rewrite or erase audit rows regardless of what `writer`'s own grants say. The guarantee is "this server, using the credentials it was configured with, cannot tamper with its own audit trail" — not "the audit trail is tamper-proof against whoever administers the database."
+- **No multi-tenancy.** One server process talks to one Postgres database with one pair of `readonly`/`writer` roles and one allowlist. There is no per-tenant credential scoping or per-tenant audit partitioning; running this for multiple tenants means running multiple server instances with separate config.
+- **No auth beyond local config.** There is no per-request end-user authentication — `caller_id` (see [Audit log](#audit-log)) identifies the deployment/config, not an individual person behind an MCP session. Anyone who can talk to this server's stdio transport (or, for approvals, reach `127.0.0.1` on the machine it runs on) can use it as whatever role it's configured with.
+- **No cloud deployment support in v1.** The localhost approval UI is bound to `127.0.0.1` on purpose (see [Localhost approval UI](#localhost-approval-ui)) and is not reachable from another machine — there is no remote-approval story, no TLS termination, no multi-user approval routing. This is designed to run next to the agent on one machine, not as a hosted service.
+- **Plan-token and approval state is in-memory and process-scoped.** `TwoPhaseWrite`'s token store has no persistence beyond the audit log — a server restart loses every pending `awaiting_approval` plan (it has to be re-previewed from scratch) and every plan's approval state. Only the *history* of what was previewed/approved/executed survives a restart, in `mcp_audit.log`; the live "can `execute_plan` accept this token right now" state does not. See `DECISIONS.md` (#6) for why this was a deliberate choice, not an oversight.
+- **`run_migration`'s allowlist enforcement doesn't cover every DDL form.** `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, and `CREATE [UNIQUE] INDEX ... ON <table>` are supported; a bare `DROP INDEX <name>` is refused outright (`UNSUPPORTED`) rather than allowlist-checked, because the table an index belongs to can't be determined from that statement's text alone. See `DECISIONS.md` (#9).
+- **Single-statement, single-database.** Every tool refuses multi-statement input and there is no cross-statement/cross-table transaction spanning multiple tool calls — each `delete_rows`/`insert_rows`/`update_rows`/`run_migration` call is its own independent preview/execute pair. There's no way to preview two related writes (e.g. an `UPDATE` plus a dependent `INSERT`) and approve them as one atomic unit.
+
+## License
+
+[MIT](./LICENSE)

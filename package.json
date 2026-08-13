@@ -3,10 +3,32 @@
   "version": "0.1.0",
   "description": "Safe-write Postgres MCP server with dual-role pools and preview-before-execute",
   "type": "module",
+  "license": "MIT",
+  "author": "jpka",
+  "homepage": "https://github.com/jpka/sw-postgres-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jpka/sw-postgres-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jpka/sw-postgres-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "postgres",
+    "postgresql",
+    "claude",
+    "claude-desktop",
+    "llm-agent",
+    "database",
+    "safe-write",
+    "audit-log"
+  ],
   "bin": {
     "sw-postgres-mcp": "dist/index.js"
   },
-  "files": ["dist"],
+  "files": ["dist", "docker/init", "config.example.json"],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",

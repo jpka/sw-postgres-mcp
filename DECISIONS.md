@@ -448,6 +448,222 @@ exposed as `reject_plan` on the MCP server.
 
 ---
 
+## 2026-08-13 — Append-only audit log: enforced by a `REVOKE`, not by application code
+
+**Ticket:** #5 — a separate `mcp_audit` schema holding one append-only table, immediately
+after the two-phase core (#4) so every later write tool inherits auditing rather than
+having it retrofitted.
+
+**Question:** the ticket's own wording is "genuinely append-only" — not a convention the
+code politely follows. What makes a guarantee like that real rather than aspirational?
+
+### Enforcement point: a grant the `writer` role does not have
+
+Two options: (a) have `TwoPhaseWrite`/`AuditLog` only ever call `INSERT` against
+`mcp_audit.log` and trust that discipline — no application code path currently issues an
+`UPDATE`/`DELETE` against it, so in practice nothing violates append-only today; (b) make
+it structurally impossible by revoking the privilege at the database. (a) was rejected
+for the same reason ticket #2's role-separation entry below rejects parsing as a safety
+boundary: "no code path does X today" is not the same claim as "no code path *can* do X,"
+and the whole value of an audit trail is that a future bug, a careless refactor, or a
+compromised dependency can't quietly rewrite history. (b) was picked:
+`docker/init/02-audit-log.sql` grants `writer` `INSERT` (and `USAGE` on the id sequence an
+`INSERT` needs) and nothing else, then explicitly
+`REVOKE UPDATE, DELETE, TRUNCATE ON mcp_audit.log FROM writer`. A `writer`-role connection
+attempting any of those three gets Postgres's own `permission denied` — asserted by a real
+test against a live database (`tests/auditLog.test.ts`), not just asserted in a comment.
+`readonly` gets `SELECT` only on the same table, so an operator can inspect the trail
+without ever having write access to it either. This mirrors ticket #2's role-separation
+entry below exactly: enforcement lives in a permission the role doesn't have, not in a
+check the application chooses to run.
+
+**Scope of the guarantee, stated honestly:** this only holds for connections that
+authenticate as `writer` (or `readonly`). A Postgres superuser, or any role with
+equivalent administrative privileges, sits outside the model entirely and can `GRANT`
+itself the revoked privileges back, or bypass them outright — no `REVOKE` on `writer` can
+stop the database's own administrator. This is not a gap the ticket missed; it is what
+"the database enforces it" always means in practice, and it is called out explicitly in
+the README's Limitations section so a reviewer doesn't mistake "genuinely append-only"
+for "tamper-proof against anyone with database admin access."
+
+### `params_redacted`: a shape, not the values
+
+The audit row's `params_redacted` column records `{ type, length }` per parameter rather
+than the literal values. An audit trail exists so an operator can reconstruct *what kind*
+of statement an agent ran and why — not to become a second copy of whatever sensitive
+data passed through the statement (an email address, a token, a customer name). Storing
+literal values would make the audit log itself a thing worth protecting as carefully as
+the tables it audits, defeating some of the point of having a comparatively low-privilege
+`readonly`-readable trail. `statement` (the SQL text) is stored in full, since
+schema/table names and the shape of a query are what audit review is actually for; only
+the parameter *values* are redacted.
+
+### Audit-write failures never mask the write's own outcome
+
+`AuditLog.record()`'s failure path is logged to stderr and swallowed rather than thrown.
+The alternative — letting a transient audit-insert failure (a brief connection blip)
+propagate as the *write's* failure, or worse, roll back a write that had already
+committed — would make a monitoring hiccup on the audit path indistinguishable from an
+actual data-safety failure, which is a strictly worse failure mode for exactly the tool
+this project is trying to be trustworthy about. The audit row is recorded on the same
+connection *after* the `COMMIT`/`ROLLBACK` it describes (see `writeCore.ts`'s `execute()`
+and `preview()`), specifically so a failure writing the audit row can never itself roll
+back a write that already succeeded, or be confused with one that failed.
+
+---
+
+## 2026-08-13 — Preview-and-rollback beats `EXPLAIN`; plan tokens bind to a statement-hash fingerprint
+
+**Ticket:** #4 — the two-phase write core (`delete_rows`, `execute_plan`, and the
+token guarantees: expiry, single-use, statement binding, the no-`WHERE` guard,
+`statement_timeout`). The largest ticket in the build, by design — "every later write
+tool inherits whatever this does."
+
+### Why the preview is a real rolled-back execution, not an `EXPLAIN` estimate
+
+**Question:** how does the server learn the exact blast radius of a write before letting
+anything commit? Two options: (a) run `EXPLAIN` (optionally `ANALYZE`) and gate on the
+planner's estimated row count; (b) actually run the statement inside `BEGIN`, capture the
+exact count via `RETURNING`, then `ROLLBACK`.
+
+(a) was rejected. A planner estimate is derived from table statistics — histograms,
+n-distinct counts — gathered by `ANALYZE`, which can be stale (most visibly right after a
+bulk load, like `npm run seed:demo`'s ~208k rows, before autovacuum's next `ANALYZE` has
+run) or simply wrong for a predicate whose column correlations the planner can't model.
+The entire safety mechanism — `approvalRequiredAboveRows`/`hardMaxRows` — is a threshold
+compared against a row count; if that count is a guess, the threshold is a guess too, and
+a statement whose *true* affected-row count is 40,000 could sail under a 100-row threshold
+because the planner estimated 80. That failure mode is silent — nothing about it looks
+wrong until the numbers are compared after the fact — which is the opposite of what an
+approval gate is for.
+
+(b) was picked: for the DML tools (`delete_rows`/`insert_rows`/`update_rows`),
+`TwoPhaseWrite.preview()` wraps the statement as
+`WITH _affected AS (${statement} RETURNING *) SELECT count(*), sample_rows, rows_digest ...`,
+runs it for real inside a transaction, then rolls back. The row count in every preview
+response is the exact count a real execution just produced — not a projection of one.
+(DDL, added later by #9's `run_migration`, has no `RETURNING` to wrap: its preview runs
+the statement directly inside `BEGIN … ROLLBACK` and reports 0 affected rows plus a
+`target` extracted from the statement text — see #9's entry above. DDL's safety comes
+from *always* requiring approval regardless of that row count, not from this exact-count
+mechanism.) This is strictly more expensive than `EXPLAIN` (a real execution, rolled back, followed
+later by another real execution to commit), which is accepted deliberately: correctness of
+the row count is the entire point of the safety layer, and `EXPLAIN`'s only remaining job
+is the separate, explicitly-cheap `explain_plan` tool — a pre-check an agent can call
+*before* attempting a two-phase write, never a substitute for the preview's real count.
+
+A consequence of "the preview is a real execution": the preview and the execute must
+never share an open transaction (an open transaction sitting idle while the agent decides
+whether to execute holds locks and a pool connection for however long that takes — from
+milliseconds to the full `planTtlMs`, 60s by default). `preview()`/`execute()` each check
+out their own connection from the pool and release it in a `finally`, so no transaction
+outlives a single call — verified directly by a test that asserts no connection is left
+mid-transaction between the two calls (`tests/twoPhaseWrite.test.ts`).
+
+### Why a plan token binds to a hash of the statement + params
+
+**Question:** a plan token is a server-issued credential — but a credential for *what*,
+exactly? If it only proves "a preview happened, at some point," nothing stops
+`execute_plan` from being called with a valid token and a *different* statement than the
+one that was actually previewed — a wider `WHERE`, a different table, extra literal rows
+— a bait-and-switch a human approving a plan in the localhost UI would have no way to
+detect, since they approved based on what the UI showed them, not on some invisible
+identity a random token carries.
+
+Two options: (a) treat the token alone as sufficient — whatever statement/params
+`execute_plan` is called with is trusted as "the thing this token authorizes"; (b) hash
+the exact statement text and parameter values at preview time, require `execute_plan` to
+pass the statement/params back, and refuse on any mismatch between the recomputed hash and
+the one stored at issuance. (a) was rejected for the bait-and-switch reason above — it
+would make the token a general "this caller may write something" capability rather than
+authorization for one specific, already-reviewed statement, which quietly undermines the
+entire point of a human-reviewable preview (ticket #6/#7's approval mechanism, built
+later, depends on this token meaning "the exact thing a human looked at").
+
+(b) was picked: `statementFingerprint(statement, params)` (`src/writeCore.ts`) is
+`sha256(statement.trim() + "\0" + JSON.stringify(params))`, computed once at preview time
+and stored on the token; `TokenStore.consume()` recomputes it from whatever `execute_plan`
+is actually called with and refuses with `STATEMENT_MISMATCH` on any deviation, before
+touching the database at all. `execute_plan`'s MCP tool schema requires the agent to pass
+`statement`/`params` back explicitly (`src/server.ts`) rather than trusting server-side
+memory alone, specifically so this recomputation has something independent to check
+against — the agent's own claim about what it's executing is verified, not assumed.
+
+This is deliberately a **separate** mechanism from the rows-affected digest check
+(`rows_digest`, also built in this ticket): the fingerprint catches "a different statement
+or different params than what was previewed," while the digest catches "the *same*
+statement, but the rows it now matches changed since preview" (e.g. a concurrent insert
+added a new row into a `WHERE`'s predicate — `ROWSET_CHANGED`). Neither check subsumes the
+other: the fingerprint alone would not catch a same-statement-different-rows race, and the
+digest alone would not stop a rewritten statement that happens to affect a same-looking
+row set. `insert_rows` (#8) and `run_migration` (#9) later needed to skip the digest check
+specifically — see their own entries above — but both keep the fingerprint check
+unconditionally; it is the one guarantee that applies to every write tool with no
+exceptions.
+
+---
+
+## 2026-08-12 — Role separation via Postgres grants, not statement parsing
+
+**Ticket:** #2 — scaffold the server with dual-role pools and `describe_schema`. The
+foundation every later tool builds on: "read-only is enforced by the database, never by
+parsing SQL. A bug in our code must not be able to turn a read tool into a write tool."
+
+**Question:** how does the server guarantee a read tool (`describe_schema`, `query`,
+`explain_plan`) can never mutate the database, no matter what SQL an agent asks it to run
+or what bug this project's own code might have?
+
+### Enforcement point: which Postgres role a connection authenticates as
+
+Two options: (a) enforce it in application code — parse or pattern-match every statement a
+read tool builds or accepts, and reject anything shaped like a write (a regex for a
+leading `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`, or a more careful SQL-aware check); (b)
+enforce it at the database — connect as two distinct Postgres roles, `readonly` (granted
+`SELECT` only) and `writer` (granted `SELECT, INSERT, UPDATE, DELETE`, further scoped by
+this project's own write allowlist), and never let a read tool acquire a connection from
+the writer pool.
+
+(a) was rejected as the primary mechanism, on the same reasoning this project later
+applied to its own read-allowlist parser: a parser can always be fooled by a form it
+wasn't specifically written to catch — a CTE-wrapped mutation
+(`WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`), a function call that mutates as
+a side effect, a quoting or escaping edge case a regex didn't anticipate — and every one of
+those is a case where the *safety property itself* fails silently, not a cosmetic bug.
+This project's own `sqlGuard.ts` (built one ticket later, for the narrower job of
+extracting table references for the *read* allowlist) is a live demonstration of how hard
+that is to get right even for a much smaller problem: it needed several dedicated
+hardening passes for quoted identifiers, `U&"..."`-escaped Unicode identifiers,
+dollar-quoted string bodies, and comment-safe scanning before it reliably resolved what a
+statement was actually referencing. A parser trying to soundly answer "is this SQL a
+mutation, in general" is a strictly harder, more open-ended version of the same problem —
+not a place to put the one guarantee this entire project exists to make.
+
+(b) was picked: `docker/init/01-roles.sql` provisions `readonly` with `SELECT` only (and
+`CREATE` explicitly revoked on the `public` schema, defense in depth against a read tool
+somehow being coerced into `CREATE TABLE ... AS`), and `writer` with full DML. A mutating
+statement submitted through the `readonly` pool is refused by Postgres itself with
+`permission denied`, regardless of what the SQL text says or how this project's own
+TypeScript parses or fails to parse it — verified against a live database in
+`tests/roles.test.ts`, not just documented. This is the same shape of guarantee ticket #5
+later reuses for the audit log's append-only property (see its entry above): a permission
+the role does not have, not a check the application chooses to run.
+
+### This doesn't retire parsing — it demotes it to defense-in-depth
+
+`query`/`explain_plan` still reject non-`SELECT`-shaped input (`assertReadStatement`) and
+still enforce the *read allowlist* by extracting table references from statement text
+(`extractTableReferences`/`assertTablesAllowlisted` in `sqlGuard.ts`) — parsing wasn't
+abandoned, it was scoped down to a job where getting it wrong has a bounded consequence.
+If that allowlist-extraction logic has an unnoticed gap (the way several review passes on
+ticket #3 kept finding and fixing them for quoted/Unicode-escaped identifiers), the worst
+case is an allowlist bypass — a table that should have been hidden becomes readable — not
+a mutation succeeding through a read tool, which the role grant prevents regardless of
+what the parsing layer does or misses. Both the tool descriptions and the README's threat
+model say this explicitly: role separation is the safety boundary; the read-allowlist
+parser is a second layer on top of it, not a replacement for it.
+
+---
+
 ## 2026-08-12 — Approval route: out-of-band localhost UI; spec-native elicitation deferred to client support
 
 **Ticket:** #1 (spike: how the current MCP spec handles human-in-the-loop approval).

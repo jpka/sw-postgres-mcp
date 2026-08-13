@@ -254,6 +254,33 @@ describe("query tool", () => {
     expect(result.rows[0].marker).toBe("hello'world;");
   });
 
+  it("quoted identifiers containing a semicolon are not mistaken for terminators", async () => {
+    await withSuperuser(async (c) => {
+      await c.query(`DROP TABLE IF EXISTS "t3q_Metric"`);
+      await c.query(`CREATE TABLE "t3q_Metric" ("value;x" TEXT)`);
+      await c.query(`INSERT INTO "t3q_Metric" ("value;x") VALUES ('ok')`);
+      await c.query(`GRANT SELECT ON "t3q_Metric" TO readonly`);
+    });
+
+    const config = makeConfig({
+      read: { schemas: [], tables: ["public.t3q_Metric"] },
+    });
+    try {
+      const result = await runQuery(
+        roPool,
+        { statement: 'SELECT "value;x" FROM "t3q_Metric"', limit: 1, reason: "test" },
+        config,
+      );
+
+      expect(result.row_count).toBe(1);
+      expect(result.rows[0]["value;x"]).toBe("ok");
+    } finally {
+      await withSuperuser(async (c) => {
+        await c.query(`DROP TABLE IF EXISTS "t3q_Metric"`);
+      });
+    }
+  });
+
   it("ONLY table references are still allowlist-checked", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

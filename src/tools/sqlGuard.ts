@@ -63,6 +63,25 @@ function scanStatement(sql: string): ScanResult {
       continue;
     }
 
+    if (ch === '"') {
+      const start = i;
+      i++;
+      while (i < n) {
+        if (sql[i] === '"') {
+          if (sql[i + 1] === '"') {
+            i += 2;
+            continue;
+          }
+          i++;
+          break;
+        }
+        i++;
+      }
+      lastRealEnd = i;
+      out += sql.slice(start, i);
+      continue;
+    }
+
     if (ch === "$") {
       const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i));
       if (tag) {
@@ -106,7 +125,8 @@ export function stripTrailingTerminators(sql: string): string {
 
 /** Throw MULTI_STATEMENT / EMPTY_STATEMENT unless `clean` is exactly one statement. */
 export function assertSingleStatement(clean: string): void {
-  const stripped = clean.trim().replace(/;+\s*$/, "");
+  const masked = clean.replace(/"(?:[^"]|"")*"/g, (m) => " ".repeat(m.length));
+  const stripped = masked.trim().replace(/;+\s*$/, "");
   if (stripped.length === 0) {
     throw new ToolFailure(
       "EMPTY_STATEMENT",

@@ -179,13 +179,19 @@ const CLAUSE_END_KEYWORDS = new Set([
   "RETURNING",
 ]);
 
-function skipWs(sql: string, i: number): number {
+/** Exported for src/tools/ddlTarget.ts, which needs the same whitespace-skip. */
+export function skipWs(sql: string, i: number): number {
   while (i < sql.length && /\s/.test(sql[i])) i++;
   return i;
 }
 
-/** Read an identifier (quoted or unquoted). Returns null when `start` is not one. */
-function readWord(
+/**
+ * Read an identifier (quoted or unquoted). Returns null when `start` is not
+ * one. Exported for src/tools/ddlTarget.ts, which reuses this rather than
+ * re-implementing quoted-identifier unescaping to parse a DDL statement's
+ * target table/index name.
+ */
+export function readWord(
   sql: string,
   start: number,
 ): { value: string; end: number; raw: string } | null {

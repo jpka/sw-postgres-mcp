@@ -13,6 +13,7 @@ import { explainPlan } from "./tools/explainPlan.js";
 import { previewDeleteRows } from "./tools/deleteRows.js";
 import { previewInsertRows } from "./tools/insertRows.js";
 import { previewUpdateRows } from "./tools/updateRows.js";
+import { previewRunMigration } from "./tools/runMigration.js";
 import { ToolFailure } from "./tools/errors.js";
 import { TwoPhaseWrite, WriteError, type WritePreview } from "./writeCore.js";
 
@@ -65,6 +66,16 @@ const updateRowsSchema = z.object({
   reason: z.string().min(1),
 });
 
+const runMigrationSchema = z.object({
+  statement: z.string().min(1),
+  // Required to match the tool's declared inputSchema below and so every
+  // audit row for a write carries a real reason (see mcp_audit.log).
+  // Deliberately no field here (or anywhere else in this schema) that could
+  // let the agent opt out of the always-approval behavior — see
+  // src/tools/runMigration.ts and DECISIONS.md.
+  reason: z.string().min(1),
+});
+
 const executePlanSchema = z.object({
   plan_token: z.string(),
   statement: z.string(),
@@ -98,7 +109,36 @@ function previewResponse(
         params: preview.params,
         affected_rows: preview.affectedRows,
         sample_rows: preview.sampleRows,
+        target: preview.target,
         message,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+/**
+ * `run_migration`'s own response shape — always `status: "awaiting_approval"`
+ * (see src/tools/runMigration.ts's `alwaysRequireApproval: true`), so unlike
+ * `previewResponse` above there is no threshold-relative message to compute:
+ * every migration requires approval regardless of `affected_rows`/`target`,
+ * which is why the message says so unconditionally rather than mentioning a
+ * row count that was never the deciding factor.
+ */
+function migrationPreviewResponse(preview: WritePreview) {
+  return text(
+    JSON.stringify(
+      {
+        status: preview.status,
+        plan_token: preview.planToken,
+        statement: preview.statement,
+        params: preview.params,
+        target: preview.target,
+        affected_rows: preview.affectedRows,
+        sample_rows: preview.sampleRows,
+        message:
+          "DDL migrations always require human approval through the localhost approval UI before execute_plan will run them, regardless of any row-count threshold.",
       },
       null,
       2,
@@ -340,9 +380,30 @@ export function createServer(
         },
       },
       {
+        name: "run_migration",
+        description:
+          "Preview a DDL migration (two-phase): CREATE TABLE, ALTER TABLE, DROP TABLE, or CREATE INDEX. Runs the statement inside a transaction, then rolls back — Postgres DDL is transactional, so nothing is changed until execute_plan is called with the returned plan_token. Unlike delete_rows/insert_rows/update_rows, run_migration ALWAYS requires human approval through the localhost approval UI before execute_plan will run it, regardless of write.approvalRequiredAboveRows/hardMaxRows — a migration affecting zero rows (e.g. adding a column) can still be highly destructive, so row count is deliberately not consulted for this tool. Multi-statement input is rejected. The statement's target table/schema must be in the write allowlist.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            statement: {
+              type: "string",
+              description:
+                "A single DDL statement, e.g. \"ALTER TABLE customers ADD COLUMN loyalty_tier text\". CREATE TABLE, ALTER TABLE, DROP TABLE, and CREATE [UNIQUE] INDEX ... ON <table> are supported.",
+            },
+            reason: {
+              type: "string",
+              description: "Why the agent is performing this migration. Recorded for audit.",
+            },
+          },
+          required: ["statement", "reason"],
+          additionalProperties: false,
+        },
+      },
+      {
         name: "execute_plan",
         description:
-          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the preview (delete_rows, insert_rows, or update_rows). The token is single-use, expires, and refuses any statement that does not match the preview. For delete_rows and update_rows, it also refuses to commit if the affected row set changed since the preview; insert_rows has no matching row set to compare (a rolled-back preview insert still consumes sequence values), so it relies on the token's fingerprint, single-use, and expiry guarantees instead. If the preview's affected-row count was above write.approvalRequiredAboveRows, execution refuses until a human approves it through an out-of-band approval surface (not available through this MCP tool set).",
+          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the preview (delete_rows, insert_rows, update_rows, or run_migration). The token is single-use, expires, and refuses any statement that does not match the preview. For delete_rows and update_rows, it also refuses to commit if the affected row set changed since the preview; insert_rows and run_migration have no matching row set to compare (a rolled-back preview insert still consumes sequence values; DDL has no RETURNING-based row set at all), so both rely on the token's fingerprint, single-use, and expiry guarantees instead. If the preview's affected-row count was above write.approvalRequiredAboveRows (or, for run_migration, unconditionally), execution refuses until a human approves it through an out-of-band approval surface (not available through this MCP tool set).",
         inputSchema: {
           type: "object",
           properties: {
@@ -439,6 +500,17 @@ export function createServer(
       try {
         const preview = await previewUpdateRows(write, config, parsed.data);
         return previewResponse(preview, config.write.approvalRequiredAboveRows);
+      } catch (err) {
+        return errorBody(err);
+      }
+    }
+
+    if (name === "run_migration") {
+      const parsed = runMigrationSchema.safeParse(args);
+      if (!parsed.success) return invalidArguments(parsed.error);
+      try {
+        const preview = await previewRunMigration(write, config, parsed.data);
+        return migrationPreviewResponse(preview);
       } catch (err) {
         return errorBody(err);
       }

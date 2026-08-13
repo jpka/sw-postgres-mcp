@@ -5,6 +5,182 @@ were, what we picked, and the reasoning a reviewer can check. Newest first.
 
 ---
 
+## 2026-08-13 — run_migration (#9): forcing approval without a threshold, DDL through a core built for RETURNING, and what "allowlist" means for a table that doesn't exist yet
+
+**Ticket:** #9 — `run_migration`, a DDL tool that reuses `TwoPhaseWrite` (built for #4,
+extended by #5/#6/#7/#8) but must **always** require human approval, never gated by the
+`approvalRequiredAboveRows`/`hardMaxRows` thresholds #6 built for the data write tools.
+Given this session's two prior review-caught security holes (agent self-approval on #6,
+CSRF on #7's HTTP server), the overriding design constraint here was: no code path,
+misconfiguration, or edge case can let a migration execute without going through the
+approval server's approve endpoint.
+
+### Forcing approval: a `WriteMeta` flag hardcoded by the tool module, not an agent-supplied parameter
+
+The ticket's own suggestion was followed as the safest option among three considered:
+(a) give `run_migration` an artificially low internal threshold (e.g. treat every DDL
+statement as "affecting" more rows than `approvalRequiredAboveRows`) so the existing
+row-count gate fires by construction, (b) add a boolean to `run_migration`'s MCP
+`inputSchema` that the agent could set, or (c) add a new `WriteMeta` field,
+`alwaysRequireApproval`, that only tool-module code sets and that `TwoPhaseWrite.preview()`
+ORs into the same `requiresApproval` decision the row-count check makes. (c) was picked.
+
+(a) was rejected outright — it is exactly the "trying to make DDL's row count naturally
+exceed the threshold" approach the ticket explicitly warns against: it would make
+`run_migration`'s approval requirement an accident of a made-up number being bigger than
+a config value nobody sees, rather than something a reviewer of `writeCore.ts` can verify
+by reading the code. It would also silently stop working (migrations would fall through
+to `status: "previewed"`) if `approvalRequiredAboveRows` were ever raised past whatever
+fake number was chosen — a config change in one place quietly weakening a guarantee in
+another, which is precisely the shape of bug this ticket calls out from #6/#7.
+
+(b) was rejected because it is a parameter the calling agent controls, even if the
+*intent* is that `run_migration` always sets it to `true` — a `z.boolean().optional()`
+in the schema that a future tweak forgets to hardcode, or that a caller talking to the
+tool via a slightly different path passes explicitly, is a live footgun. The ticket is
+explicit that the flag "can't be spoofed or bypassed by the calling agent."
+
+(c) closes that gap structurally: `alwaysRequireApproval` is not part of
+`run_migration`'s `inputSchema` in `src/server.ts` at all — nothing in the parsed
+`args` reaches it. `src/tools/runMigration.ts` sets `alwaysRequireApproval: true`
+unconditionally on its one call to `write.preview()`; there is no branch, no
+config-driven default, no way to construct a `run_migration` call that omits it. The
+same idea already exists in this codebase for a different reason — `tool` on
+`WriteMeta` is likewise set by the calling tool module, never taken from agent input —
+so this is one more field in the same "meta the tool module owns" bucket, not a new
+category of state. `TwoPhaseWrite.preview()`'s change is one line:
+`requiresApproval = meta.alwaysRequireApproval === true || affectedRows > this.approvalRequiredAboveRows`.
+`write.hardMaxRows` needed no equivalent override: `run_migration`'s `affectedRows` is
+always `0` (see below), which can never exceed a hard cap that config validation
+already requires to be a positive integer, so the hard-cap wall simply never applies to
+DDL — not because it was special-cased away, but because the number it compares
+against is structurally always small enough.
+
+An alternative not taken: making `isDdlStatement(statement)` (see below) itself force
+approval, so *any* CREATE/ALTER/DROP text preview() ever sees requires approval,
+regardless of which tool called it. This would arguably be even harder to bypass by
+accident. It was rejected because it conflates two independent concerns that happen to
+share one keyword check: "how do I build valid SQL for this statement" (mechanical,
+derived from statement text, safe to get from a regex) and "does this specific call
+require a human" (a security decision that should be an explicit, auditable choice by
+the calling tool module, not an emergent property of what a statement's first word
+happens to be). Keeping them separate means a future non-DDL tool that also needs
+mandatory approval doesn't have to construct DDL-shaped SQL to get it.
+
+### Why `writeCore.ts` needed a real code path for DDL, not just a threshold tweak
+
+`TwoPhaseWrite.preview()`/`execute()` wrap every statement as
+`WITH _affected AS (${statement} RETURNING *) SELECT count(*), sample_rows, rows_digest ...`
+— this is invalid SQL for `CREATE TABLE`/`ALTER TABLE`/`DROP TABLE`/`CREATE INDEX`,
+none of which support a `RETURNING` clause. Wiring `run_migration` through the
+unmodified core (as attempted first, mirroring #8's "wire it straight through and see
+what breaks" approach) fails on the first `CREATE TABLE` preview with a syntax error,
+not a `ROWSET_CHANGED` mismatch the way #8's INSERT case did — DDL doesn't get far
+enough into the existing SQL to reach that check at all.
+
+Fix: a new `isDdlStatement(statement)` leading-keyword check (`^\s*(create|alter|drop)\b`,
+the same "this project's own tool code builds every statement, never raw agent SQL"
+reasoning `isInsertStatement` already relies on) branches both `preview()` and
+`execute()`. When true, the raw statement runs directly inside the same
+`BEGIN`/`ROLLBACK` (preview) or `BEGIN`/`COMMIT` (execute) — Postgres DDL is
+transactional, so this rolls back and commits exactly like the RETURNING-wrapped path
+does for DELETE/UPDATE/INSERT, verified against a live Postgres in
+`tests/runMigration.test.ts` for `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, and
+`CREATE INDEX` (preview leaves no trace; execute, once approved, leaves exactly the
+expected table/column/index behind). `affectedRows`/`sampleRows` are hardcoded to
+`0`/`[]` on this path — not a fake row count standing in for something else, but the
+literal, accurate answer for a statement with no `RETURNING` rows to report.
+
+### The ROWSET_CHANGED digest check: skipped for DDL, for a stronger reason than INSERT's
+
+Ticket #8's entry above explains why the digest comparison is skipped for INSERT: there's no
+pre-existing matched row set to compare against, so the check would false-positive on
+every insert into a table with a server-generated column. DDL shares that same
+underlying reason (no pre-existing matched rows a WHERE clause selected) but more
+fundamentally: there is no digest to compare in the first place, because there was
+never a `RETURNING` result to hash. `execute()`'s DDL branch skips the whole
+digest-comparison block, not just the equality check — `rowsDigest` is set to `""` at
+preview time and never read back out on the DDL path. What `run_migration` keeps from
+the core, same as INSERT: `statementFingerprint`-bound tokens (so `execute_plan` cannot
+run a different statement than what was previewed and approved), single-use/expiring
+tokens, the approval mechanism (now unconditional rather than threshold-driven — see
+above), and full audit logging on every path.
+
+### What "allowlist" means for DDL: extract the target from statement text, not a catalog lookup
+
+`delete_rows`/`insert_rows`/`update_rows` take a structured `table` argument and check
+it against `isTableWritable` before building any SQL. `run_migration` takes a single
+opaque `statement` string instead (DDL is too varied — `CREATE TABLE`, `ALTER TABLE ...
+ADD COLUMN`, `CREATE INDEX ... ON` — to fit the same `table`/`columns`/`set` shape), so
+enforcing the same allowlist meant first extracting *which* table/index the statement
+names.
+
+A catalog lookup (resolve the name against `pg_class`, the way `sqlGuard.ts`'s
+`assertTablesAllowlisted` already does for the read allowlist) was rejected as the
+primary mechanism: `CREATE TABLE`'s target doesn't exist yet at preview time, so
+`to_regclass` on it always returns null — there is nothing in the catalog to look up.
+The allowlist check has to work from the statement's own text.
+
+`src/tools/ddlTarget.ts`'s `parseDdlStatement()` does this with a small, deliberately
+narrow parser reusing `sanitizeSql`/`readWord`/`skipWs` from `sqlGuard.ts` (exported for
+this purpose) rather than a second, independent tokenizer that could disagree with the
+first on edge cases (quoted identifiers, a string literal containing `;` or a keyword).
+It recognizes exactly the forms the ticket names — `CREATE TABLE`, `ALTER TABLE`,
+`DROP TABLE` (one or more comma-separated targets), and `CREATE [UNIQUE] INDEX
+[CONCURRENTLY] [IF NOT EXISTS] [name] ON [ONLY] <table>` — and reports anything else,
+including a bare `DROP INDEX`, as `UNSUPPORTED` with no targets. `run_migration` treats
+`UNSUPPORTED` (or a recognized form whose target still failed to parse) as a hard
+refusal (`INVALID_INPUT`), not a silent skip of the allowlist check — deny-by-default,
+consistent with `isTableWritable`'s own "no config means nothing is writable" default.
+
+`DROP INDEX` was deliberately left unsupported rather than half-supported: the table an
+index belongs to cannot be determined from `DROP INDEX <name>`'s statement text alone —
+unlike `CREATE INDEX ... ON <table>`, there's no `<table>` in the statement — so
+enforcing the allowlist for it would require a `pg_index`/`pg_class` catalog lookup
+using the writer pool, similar to `assertTablesAllowlisted`, before ever calling
+`write.preview()`. That's a reasonable follow-up but adds a second kind of DDL target
+resolution (text-based for everything else, catalog-based for this one form) for a
+statement form the ticket's own examples ("CREATE/ALTER/DROP TABLE, indexes, etc.")
+don't call out specifically; refusing it clearly (with a hint naming the supported
+forms) was judged better than shipping a half-implemented allowlist check for it.
+
+### `target` threaded through `WritePreview`/`PendingPlan`, not a new audit-log column
+
+The ticket asks the pending-plan view to show "the exact statement, the target
+table/schema if extractable, and the reason." `statement` and `reason` already flow
+through the existing `WriteMeta`/`TokenEntry`/`PendingPlan` plumbing #6/#7 built;
+`target` (the schema-qualified name(s) `ddlTarget.ts` extracted, e.g.
+`"public.customers"`) was added as one more field alongside them — `WriteMeta.target` →
+`TokenMeta.target`/`TokenEntry.target` → `WritePreview.target`/`PendingPlan.target` —
+rather than a parallel data structure. It's `null` for every other tool (their
+`affected_rows`/`sample_rows` already identify what the statement touches, so there's
+nothing for `target` to add there). No `mcp_audit.log` schema change was needed: the
+audit row's existing `statement` column already contains the full DDL text a human or
+operator can re-derive the target from, and the ticket's audit acceptance criterion
+only calls for the `reason` — adding a redundant `target` column purely for display
+would be exactly the kind of drift-prone duplicate column the #7 entry below already
+argued against when it reused `approved_by` for "who rejected" instead of adding
+`rejected_by`.
+
+### Multi-statement guard: reused `sqlGuard.ts`'s `assertSingleStatement`, not a new one
+
+`delete_rows`/`insert_rows`/`update_rows` never faced this problem the same way —
+they take structured arguments (`table`, `where`, `set`) and build the SQL themselves,
+so there was never a raw agent-supplied statement string to split on `;` in the first
+place (and node-postgres's extended query protocol, which every write tool already uses
+by always passing a `values` array even when empty, refuses multiple statements in one
+`Parse` message regardless). `run_migration` is different: `statement` *is* raw
+agent-supplied text, the same shape `query`/`explain_plan` already accept. Rather than
+write a second multi-statement detector, `run_migration` calls the exact same
+`sanitizeSql` + `assertSingleStatement` pair those two read tools use — the same
+comment/string-literal-safe masking, the same `MULTI_STATEMENT`/`EMPTY_STATEMENT`
+error codes — before ever calling `write.preview()`, so a semicolon or the word
+CREATE/ALTER/DROP inside a quoted identifier or a string-literal default value (e.g.
+`DEFAULT 'a; maybe-keyword-looking text'`) doesn't false-positive, verified in
+`tests/runMigration.test.ts`.
+
+---
+
 ## 2026-08-13 — insert_rows/update_rows (#8): shared guard, and why the rows-changed digest must skip INSERT
 
 **Ticket:** #8 — extend the two-phase core (`src/writeCore.ts`, built for #4/#6/#5/#7)

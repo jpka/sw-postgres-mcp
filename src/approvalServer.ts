@@ -165,10 +165,13 @@ function renderPlanCard(plan: PendingPlan): string {
         <span class="expiry">expires in ~${secondsLeft}s</span>
       </header>
       <dl>
+        <dt>Tool</dt>
+        <dd>${escapeHtml(plan.tool)}</dd>
         <dt>Statement</dt>
         <dd><pre>${escapeHtml(plan.statement)}</pre></dd>
         <dt>Params</dt>
         <dd><pre>${escapeHtml(JSON.stringify(plan.params))}</pre></dd>
+        ${plan.target ? `<dt>Target</dt>\n        <dd>${escapeHtml(plan.target)}</dd>` : ""}
         <dt>Reason given by agent</dt>
         <dd>${plan.reason ? escapeHtml(plan.reason) : "<em>(none given)</em>"}</dd>
         <dt>Sample of affected rows (first ${plan.sampleRows.length})</dt>
@@ -272,6 +275,7 @@ function planToJson(plan: PendingPlan) {
     params: plan.params,
     affected_rows: plan.previewRows,
     sample_rows: plan.sampleRows,
+    target: plan.target,
     expires_at: plan.expiresAt,
     caller_id: plan.callerId,
   };

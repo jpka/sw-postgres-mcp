@@ -16,24 +16,24 @@ describe("MCP server describe_schema", () => {
     await waitForDb(SUPERUSER_URL);
 
     await withSuperuser(async (c) => {
-      await c.query(`DROP TABLE IF EXISTS orders CASCADE`);
-      await c.query(`DROP TABLE IF EXISTS customers CASCADE`);
+      await c.query(`DROP TABLE IF EXISTS _srv_orders CASCADE`);
+      await c.query(`DROP TABLE IF EXISTS _srv_customers CASCADE`);
       await c.query(`
-        CREATE TABLE customers (
+        CREATE TABLE _srv_customers (
           id SERIAL PRIMARY KEY,
           email TEXT NOT NULL
         )
       `);
       await c.query(`
-        CREATE TABLE orders (
+        CREATE TABLE _srv_orders (
           id SERIAL PRIMARY KEY,
-          customer_id INT NOT NULL REFERENCES customers(id),
+          customer_id INT NOT NULL REFERENCES _srv_customers(id),
           total_cents INT NOT NULL
         )
       `);
-      await c.query(`INSERT INTO customers (email) VALUES ('x@example.com')`);
-      await c.query(`INSERT INTO orders (customer_id, total_cents) VALUES (1, 500)`);
-      await c.query(`ANALYZE customers; ANALYZE orders;`);
+      await c.query(`INSERT INTO _srv_customers (email) VALUES ('x@example.com')`);
+      await c.query(`INSERT INTO _srv_orders (customer_id, total_cents) VALUES (1, 500)`);
+      await c.query(`ANALYZE _srv_customers; ANALYZE _srv_orders;`);
     });
 
     const config: AppConfig = {
@@ -60,8 +60,8 @@ describe("MCP server describe_schema", () => {
     await serverPools?.readonlyPool.end().catch(() => {});
     await serverPools?.writerPool.end().catch(() => {});
     await withSuperuser(async (c) => {
-      await c.query(`DROP TABLE IF EXISTS orders CASCADE`);
-      await c.query(`DROP TABLE IF EXISTS customers CASCADE`);
+      await c.query(`DROP TABLE IF EXISTS _srv_orders CASCADE`);
+      await c.query(`DROP TABLE IF EXISTS _srv_customers CASCADE`);
     });
   });
 
@@ -74,12 +74,12 @@ describe("MCP server describe_schema", () => {
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
     const parsed = JSON.parse(text) as { tables: Array<{ schema: string; table: string; columns: unknown[]; foreignKeys: unknown[]; rowCountEstimate: number }> };
     expect(Array.isArray(parsed.tables)).toBe(true);
-    const customers = parsed.tables.find((t) => t.table === "customers");
+    const customers = parsed.tables.find((t) => t.table === "_srv_customers");
     expect(customers).toBeDefined();
     expect(customers!.columns.length).toBeGreaterThan(0);
     expect(typeof customers!.rowCountEstimate).toBe("number");
 
-    const orders = parsed.tables.find((t) => t.table === "orders");
+    const orders = parsed.tables.find((t) => t.table === "_srv_orders");
     expect(orders).toBeDefined();
     expect((orders!.foreignKeys as unknown[]).length).toBeGreaterThan(0);
   });

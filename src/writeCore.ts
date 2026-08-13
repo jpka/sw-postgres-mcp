@@ -6,6 +6,7 @@ export type WriteErrorCode =
   | "EXPIRED_TOKEN"
   | "USED_TOKEN"
   | "STATEMENT_MISMATCH"
+  | "ROWSET_CHANGED"
   | "STATEMENT_TIMEOUT"
   | "NO_WHERE_CLAUSE"
   | "TABLE_NOT_WRITABLE"
@@ -45,6 +46,7 @@ export interface TwoPhaseWriteOptions {
 
 interface TokenEntry {
   fingerprint: string;
+  rowsDigest: string;
   expiresAt: number;
   used: boolean;
 }
@@ -72,11 +74,12 @@ class TokenStore {
 
   constructor(private ttlMs: number) {}
 
-  create(fingerprint: string): string {
+  create(fingerprint: string, rowsDigest: string): string {
     this.prune();
     const token = randomBytes(24).toString("hex");
     this.tokens.set(token, {
       fingerprint,
+      rowsDigest,
       expiresAt: Date.now() + this.ttlMs,
       used: false,
     });
@@ -86,7 +89,7 @@ class TokenStore {
   consume(
     token: string,
     fingerprint: string,
-  ): { ok: true } | { ok: false; error: WriteError } {
+  ): { ok: true; rowsDigest: string } | { ok: false; error: WriteError } {
     const entry = this.tokens.get(token);
     if (!entry) {
       return {
@@ -128,7 +131,7 @@ class TokenStore {
       };
     }
     entry.used = true;
-    return { ok: true };
+    return { ok: true, rowsDigest: entry.rowsDigest };
   }
 
   private prune(): void {
@@ -143,10 +146,14 @@ class TokenStore {
 
 /**
  * Two-phase write machinery. A preview runs the statement inside a transaction,
- * captures the exact affected row count and a sample of affected rows via
- * RETURNING, then rolls back. The returned token lets `execute` replay the
- * identical statement and commit, but only once, before expiry, and only for
- * the exact statement+params the token was bound to.
+ * captures the exact affected row count, a sample of affected rows via
+ * RETURNING, and a digest of the full affected row set, then rolls back. The
+ * returned token lets `execute` replay the identical statement and commit, but
+ * only once, before expiry, for the exact statement+params the token was bound
+ * to, and only if the affected row set still matches the preview. `execute`
+ * recomputes the digest inside its own transaction and refuses to commit if it
+ * differs, so concurrent inserts/updates cannot cause rows outside the approved
+ * preview to be deleted.
  *
  * The preview and the execute never share an open transaction: each call
  * checks out its own connection from the pool, so no transaction is left open
@@ -173,6 +180,7 @@ export class TwoPhaseWrite {
       const row = res.rows[0] as {
         affected_rows: number;
         sample_rows: unknown;
+        rows_digest: string;
       };
       const affectedRows = Number(row.affected_rows);
       const sampleRows = Array.isArray(row.sample_rows)
@@ -181,6 +189,7 @@ export class TwoPhaseWrite {
 
       const planToken = this.store.create(
         statementFingerprint(statement, params),
+        row.rows_digest,
       );
       return { planToken, affectedRows, sampleRows, statement, params };
     } catch (err) {
@@ -204,9 +213,21 @@ export class TwoPhaseWrite {
     try {
       await client.query(`SET statement_timeout = ${this.opts.statementTimeoutMs}`);
       await client.query("BEGIN");
-      const res = await client.query(statement, params as unknown[]);
+      const res = await client.query(this.executeSql(statement), params as unknown[]);
+      const row = res.rows[0] as {
+        affected_rows: number;
+        rows_digest: string;
+      };
+      if (row.rows_digest !== consumed.rowsDigest) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw new WriteError(
+          "ROWSET_CHANGED",
+          "The set of rows the statement would affect changed since the preview.",
+          "Another write or transaction modified matching rows. Re-run delete_rows to obtain a fresh preview and token.",
+        );
+      }
       await client.query("COMMIT");
-      return { affectedRows: res.rowCount ?? 0 };
+      return { affectedRows: Number(row.affected_rows) };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       throw translateDbError(err);
@@ -223,10 +244,36 @@ SELECT
   COALESCE(
     (SELECT json_agg(_sub) FROM (SELECT * FROM _affected AS _sub LIMIT 10) AS _sub),
     '[]'::json
-  ) AS sample_rows
+  ) AS sample_rows,
+  ${rowsDigestExpr()}
 FROM _affected
 `;
   }
+
+  private executeSql(statement: string): string {
+    return `
+WITH _affected AS (${statement} RETURNING *)
+SELECT
+  count(*)::int AS affected_rows,
+  ${rowsDigestExpr()}
+FROM _affected
+`;
+  }
+}
+
+/**
+ * A deterministic digest over the exact rows the statement would affect. The
+ * token is bound to this digest so `execute` can refuse to commit a delete that
+ * no longer matches the approved preview: the digest changes if a row enters or
+ * leaves the predicate, or if an affected row's content changes, between
+ * preview and execution.
+ */
+function rowsDigestExpr(): string {
+  return `COALESCE(
+    (SELECT md5(string_agg(row_to_json(_s)::text, E'\\n' ORDER BY row_to_json(_s)::text))
+     FROM _affected AS _s),
+    ''
+  ) AS rows_digest`;
 }
 
 function translateDbError(err: unknown): unknown {

@@ -245,6 +245,55 @@ describe("two-phase write core", () => {
     expect(await countRows()).toBe(5);
   });
 
+  it("execution is refused when matching rows change between preview and execute", async () => {
+    const tw = new TwoPhaseWrite({
+      pool: writerPool,
+      planTtlMs: 60_000,
+      statementTimeoutMs: 10_000,
+    });
+    const preview = await tw.preview(
+      `DELETE FROM "public"."${TABLE}" WHERE active = false`,
+      [],
+    );
+    expect(preview.affectedRows).toBe(2);
+
+    await withSuperuser(async (c) => {
+      await c.query(
+        `INSERT INTO ${TABLE} (email, active) VALUES ('f@example.com', false)`,
+      );
+    });
+
+    await expect(
+      tw.execute(preview.planToken, preview.statement, preview.params),
+    ).rejects.toMatchObject({ code: "ROWSET_CHANGED" });
+    expect(await countRows()).toBe(6);
+  });
+
+  it("execution is refused when an affected row's content changes between preview and execute", async () => {
+    const tw = new TwoPhaseWrite({
+      pool: writerPool,
+      planTtlMs: 60_000,
+      statementTimeoutMs: 10_000,
+    });
+    const preview = await tw.preview(
+      `DELETE FROM "public"."${TABLE}" WHERE active = false`,
+      [],
+    );
+    expect(preview.affectedRows).toBe(2);
+
+    await withSuperuser(async (c) => {
+      await c.query(
+        `UPDATE ${TABLE} SET email = 'changed@example.com'
+         WHERE id = (SELECT id FROM ${TABLE} WHERE active = false ORDER BY id LIMIT 1)`,
+      );
+    });
+
+    await expect(
+      tw.execute(preview.planToken, preview.statement, preview.params),
+    ).rejects.toMatchObject({ code: "ROWSET_CHANGED" });
+    expect(await countRows()).toBe(5);
+  });
+
   it("DELETE without a WHERE clause is refused unless confirm_full_table is passed", async () => {
     const refused = await client.callTool({
       name: "delete_rows",

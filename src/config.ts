@@ -110,20 +110,23 @@ export function loadConfig(configPath?: string): AppConfig {
   const allowRaw = (r.allowlist ?? {}) as Record<string, unknown>;
   const writeRaw = (r.write ?? {}) as Record<string, unknown>;
 
-  const numberOr = (v: unknown, fallback: number): number =>
-    typeof v === "number" && Number.isFinite(v) ? v : fallback;
+  const positiveIntOrThrow = (value: unknown, setting: string): number | undefined => {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
+    throw new Error(
+      `write.${setting} must be a positive integer, got ${JSON.stringify(value)}`,
+    );
+  };
 
   const write: WriteConfig = {
     planTtlMs:
-      numberOr(
-        parseIntSafe(process.env.SW_PLAN_TTL_MS),
-        numberOr(writeRaw.planTtlMs, DEFAULT_WRITE_CONFIG.planTtlMs),
-      ),
+      positiveIntOrThrow(parseIntSafe(process.env.SW_PLAN_TTL_MS), "planTtlMs") ??
+      positiveIntOrThrow(writeRaw.planTtlMs, "planTtlMs") ??
+      DEFAULT_WRITE_CONFIG.planTtlMs,
     statementTimeoutMs:
-      numberOr(
-        parseIntSafe(process.env.SW_STATEMENT_TIMEOUT_MS),
-        numberOr(writeRaw.statementTimeoutMs, DEFAULT_WRITE_CONFIG.statementTimeoutMs),
-      ),
+      positiveIntOrThrow(parseIntSafe(process.env.SW_STATEMENT_TIMEOUT_MS), "statementTimeoutMs") ??
+      positiveIntOrThrow(writeRaw.statementTimeoutMs, "statementTimeoutMs") ??
+      DEFAULT_WRITE_CONFIG.statementTimeoutMs,
   };
 
   // Allowlist supports both nested {read, write} and legacy flat keys for backwards compat

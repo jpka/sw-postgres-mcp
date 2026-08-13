@@ -238,6 +238,22 @@ describe("query tool", () => {
     expect(result.rows[0].n).toBe(1);
   });
 
+  it("an escape string with an escaped quote and semicolon is not mistaken for a terminator", async () => {
+    const config = makeConfig();
+    const result = await runQuery(
+      roPool,
+      {
+        statement: "SELECT E'hello\\'world;' AS marker",
+        limit: 1,
+        reason: "test escape string",
+      },
+      config,
+    );
+
+    expect(result.row_count).toBe(1);
+    expect(result.rows[0].marker).toBe("hello'world;");
+  });
+
   it("ONLY table references are still allowlist-checked", async () => {
     const config = makeConfig({
       read: { schemas: [], tables: ["public.t3q_customers"] },

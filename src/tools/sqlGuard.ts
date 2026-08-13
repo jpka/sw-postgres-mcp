@@ -39,8 +39,15 @@ function scanStatement(sql: string): ScanResult {
     }
 
     if (ch === "'") {
+      const eString = i >= 1 && /^[Ee]$/.test(sql[i - 1]);
+      const uString = i >= 2 && sql[i - 1] === "&" && /^[Uu]$/.test(sql[i - 2]);
+      const escapeCapable = eString || uString;
       i++;
       while (i < n) {
+        if (escapeCapable && sql[i] === "\\") {
+          i += 2;
+          continue;
+        }
         if (sql[i] === "'") {
           if (sql[i + 1] === "'") {
             i += 2;

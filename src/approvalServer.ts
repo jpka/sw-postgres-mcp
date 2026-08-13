@@ -61,6 +61,7 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(payload),
+    "Cache-Control": "no-store",
   });
   res.end(payload);
 }
@@ -69,6 +70,7 @@ function sendHtml(res: http.ServerResponse, status: number, body: string): void 
   res.writeHead(status, {
     "Content-Type": "text/html; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store",
   });
   res.end(body);
 }
@@ -90,6 +92,54 @@ function statusForErrorCode(code: string): number {
 function stringField(body: Record<string, unknown>, key: string): string | null {
   const value = body[key];
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+/**
+ * Loopback binding alone does not stop CSRF: any page open in a browser on
+ * the same machine can still reach `http://127.0.0.1:<port>/...`, because
+ * loopback-bound sockets are still same-machine-reachable by any local
+ * process, browser tab included. What distinguishes "the human loaded this
+ * approval page and clicked a button" from "an unrelated webpage silently
+ * hit this endpoint in the background" is request provenance: the Host the
+ * browser thinks it's talking to, the Origin the request came from (when
+ * present), and the browser-set Sec-Fetch-Site hint.
+ *
+ * `Host` is checked against `req.socket.localPort` (the actual bound port
+ * for that connection) rather than `config.port`, since `config.port` can be
+ * `0` ("pick any free port", used by tests) and the real answer is only
+ * known after `listen()`.
+ *
+ * `Origin` and `Sec-Fetch-Site` are only enforced when present: non-browser
+ * clients (curl, the test suite, MCP-adjacent tooling hitting these routes
+ * directly) never send them, and that's a normal, legitimate way to reach
+ * this server — only a *mismatched* value is evidence of a cross-origin
+ * request.
+ */
+function checkRequestProvenance(req: http.IncomingMessage): string | null {
+  const expectedHost = `${LOOPBACK_HOST}:${req.socket.localPort}`;
+  const hostHeader = req.headers.host;
+  if (hostHeader !== expectedHost) {
+    return `Host header must be "${expectedHost}", got ${hostHeader ? `"${hostHeader}"` : "(none)"}`;
+  }
+
+  const origin = req.headers.origin;
+  if (typeof origin === "string" && origin !== `http://${expectedHost}`) {
+    return `Origin header "${origin}" does not match this server's origin`;
+  }
+
+  const secFetchSite = req.headers["sec-fetch-site"];
+  if (typeof secFetchSite === "string" && secFetchSite !== "same-origin") {
+    return `Sec-Fetch-Site "${secFetchSite}" is not same-origin`;
+  }
+
+  return null;
+}
+
+/** Case-insensitive, ignores a trailing `; charset=...` parameter. */
+function hasJsonContentType(req: http.IncomingMessage): boolean {
+  const contentType = req.headers["content-type"];
+  if (typeof contentType !== "string") return false;
+  return contentType.split(";")[0]?.trim().toLowerCase() === "application/json";
 }
 
 const HTML_ESCAPES: Record<string, string> = {
@@ -255,6 +305,16 @@ async function handleRequest(
   const url = new URL(req.url ?? "/", `http://${LOOPBACK_HOST}`);
   const path = url.pathname;
 
+  // Applied to every route, including the read-only GET ones: a page that
+  // can read /api/plans has already learned real row contents, and DNS
+  // rebinding can point a hostile page's Host header at this origin, so
+  // "read-only" GETs get the same provenance check as the mutating POSTs.
+  const provenanceError = checkRequestProvenance(req);
+  if (provenanceError) {
+    sendJson(res, 403, { ok: false, code: "FORBIDDEN", message: provenanceError });
+    return;
+  }
+
   if (method === "GET" && path === "/") {
     sendHtml(res, 200, renderPage(write.listPendingPlans()));
     return;
@@ -267,7 +327,31 @@ async function handleRequest(
 
   const actionMatch = /^\/api\/plans\/([^/]+)\/(approve|reject)$/.exec(path);
   if (method === "POST" && actionMatch) {
-    const planToken = decodeURIComponent(actionMatch[1]);
+    // Browsers only preflight non-"simple" requests, so a Content-Type of
+    // text/plain (or no Content-Type at all) is enough to let a cross-origin
+    // page fire a real POST with no preflight for the browser to block. The
+    // provenance check above already rejects a mismatched Origin, but this
+    // is a second, independent gate: it also blocks a same-page <form> POST
+    // (which browsers always send without any preflight, Origin included)
+    // from masquerading as this JSON API.
+    if (!hasJsonContentType(req)) {
+      sendJson(res, 415, {
+        ok: false,
+        code: "UNSUPPORTED_MEDIA_TYPE",
+        message: 'Content-Type must be "application/json"',
+      });
+      return;
+    }
+
+    let planToken: string;
+    try {
+      planToken = decodeURIComponent(actionMatch[1]);
+    } catch {
+      // A malformed percent-escape in the token segment isn't a server
+      // error — it just doesn't name a real route.
+      sendJson(res, 404, { ok: false, code: "NOT_FOUND", message: `No route for ${method} ${path}` });
+      return;
+    }
     const action = actionMatch[2];
     const body = await readJsonBody(req);
 

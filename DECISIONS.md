@@ -15,7 +15,7 @@ reasoning, same "not an MCP tool" security boundary, now extended to a symmetric
 concluded the out-of-band localhost page is the primary approval mechanism because no
 shipping client we target implements spec-native elicitation/MRTR yet. Nothing about
 that client-support situation changed by this ticket, so this page is built exactly as
-#1 anticipated — no divergence to record there.
+ticket #1 anticipated — no divergence to record there.
 
 ### Where the pending-plan data (statement, sample rows) lives
 

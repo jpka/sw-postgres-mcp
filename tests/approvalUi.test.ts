@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import http from "node:http";
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import pg from "pg";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -56,6 +57,29 @@ async function auditRowsForReason(reason: string): Promise<Record<string, unknow
       [reason],
     );
     return r.rows;
+  });
+}
+
+/**
+ * Sends a raw HTTP request with full control over headers — including ones
+ * the Fetch spec forbids scripts from setting (`Host` in particular), which
+ * is exactly what's needed to exercise the CSRF-hardening request-provenance
+ * checks below. Node's `fetch()` silently overwrites a `Host` header with
+ * the URL's own authority, so it can't be used for that case.
+ */
+function rawRequest(
+  url: string,
+  options: http.RequestOptions & { body?: string },
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(url, options, (res) => {
+      let data = "";
+      res.on("data", (chunk: Buffer) => (data += chunk.toString("utf-8")));
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: data }));
+    });
+    req.on("error", reject);
+    if (options.body !== undefined) req.write(options.body);
+    req.end();
   });
 }
 
@@ -417,6 +441,157 @@ describe("localhost approval UI is reachable over plain HTTP without any MCP cli
   it("an unknown route returns a structured 404", async () => {
     const baseUrl = `http://${approval.host}:${approval.port}`;
     const resp = await fetch(`${baseUrl}/nope`);
+    expect(resp.status).toBe(404);
+    const json = (await resp.json()) as { ok: boolean; code: string };
+    expect(json.ok).toBe(false);
+    expect(json.code).toBe("NOT_FOUND");
+  });
+});
+
+describe("localhost approval UI: CSRF / request-provenance hardening", () => {
+  let writerPool: pg.Pool;
+  let write: TwoPhaseWrite;
+  let approval: ApprovalServerHandle;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    await waitForDb(SUPERUSER_URL);
+    await resetTable();
+    writerPool = new pg.Pool({ connectionString: WRITER_URL, max: 2 });
+    write = new TwoPhaseWrite({
+      pool: writerPool,
+      planTtlMs: 60_000,
+      statementTimeoutMs: 10_000,
+      approvalRequiredAboveRows: 2,
+      hardMaxRows: 500,
+    });
+    approval = await startApprovalServer(write, { enabled: true, port: 0 });
+    baseUrl = `http://${approval.host}:${approval.port}`;
+  });
+
+  afterAll(async () => {
+    await approval?.close().catch(() => {});
+    await writerPool?.end().catch(() => {});
+    await withSuperuser(async (c) => {
+      await c.query(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
+    });
+  });
+
+  it("rejects a request with a Host header that doesn't match the actual bound port", async () => {
+    const result = await rawRequest(`${baseUrl}/api/plans`, {
+      method: "GET",
+      headers: { Host: "evil.example.com" },
+    });
+    expect(result.status).toBe(403);
+    const json = JSON.parse(result.body) as { ok: boolean; code: string };
+    expect(json.ok).toBe(false);
+    expect(json.code).toBe("FORBIDDEN");
+  });
+
+  it("rejects a request with an Origin header that doesn't match this server's origin", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`, {
+      headers: { Origin: "http://evil.example.com" },
+    });
+    expect(resp.status).toBe(403);
+    const json = (await resp.json()) as { ok: boolean; code: string };
+    expect(json.ok).toBe(false);
+    expect(json.code).toBe("FORBIDDEN");
+  });
+
+  it("rejects a request with Sec-Fetch-Site: cross-site", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`, {
+      headers: { "Sec-Fetch-Site": "cross-site" },
+    });
+    expect(resp.status).toBe(403);
+    const json = (await resp.json()) as { ok: boolean; code: string };
+    expect(json.ok).toBe(false);
+    expect(json.code).toBe("FORBIDDEN");
+  });
+
+  it("rejects a POST to an approve/reject route whose Content-Type isn't application/json", async () => {
+    const preview = await write.preview(`DELETE FROM ${TABLE} WHERE id <= 5`, [], {
+      tool: "delete_rows",
+      reason: `csrf-content-type-${randomUUID()}`,
+    });
+    expect(preview.status).toBe("awaiting_approval");
+    // A CORS "simple request" Content-Type — this is exactly the shape a
+    // cross-origin page could send with fetch() or a <form> POST without the
+    // browser ever issuing a preflight request.
+    const resp = await fetch(
+      `${baseUrl}/api/plans/${encodeURIComponent(preview.planToken)}/approve`,
+      { method: "POST", headers: { "Content-Type": "text/plain" }, body: "{}" },
+    );
+    expect(resp.status).toBe(415);
+    const json = (await resp.json()) as { ok: boolean; code: string };
+    expect(json.ok).toBe(false);
+    expect(json.code).toBe("UNSUPPORTED_MEDIA_TYPE");
+
+    // The plan is untouched — still approvable the legitimate way.
+    const list = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+      plans: Array<Record<string, unknown>>;
+    };
+    expect(list.plans.find((p) => p.plan_token === preview.planToken)).toBeDefined();
+  });
+
+  it("rejects a POST with no Content-Type at all", async () => {
+    const preview = await write.preview(`DELETE FROM ${TABLE} WHERE id <= 1`, [], {
+      tool: "delete_rows",
+      reason: `csrf-no-content-type-${randomUUID()}`,
+    });
+    const result = await rawRequest(
+      `${baseUrl}/api/plans/${encodeURIComponent(preview.planToken)}/approve`,
+      { method: "POST", body: "{}" },
+    );
+    expect(result.status).toBe(415);
+    const json = JSON.parse(result.body) as { ok: boolean; code: string };
+    expect(json.ok).toBe(false);
+    expect(json.code).toBe("UNSUPPORTED_MEDIA_TYPE");
+  });
+
+  it("still serves legitimate requests: matching Host, no Origin, correct Content-Type", async () => {
+    const getResp = await fetch(`${baseUrl}/api/plans`);
+    expect(getResp.status).toBe(200);
+
+    const preview = await write.preview(`DELETE FROM ${TABLE} WHERE id <= 1`, [], {
+      tool: "delete_rows",
+      reason: `csrf-legit-${randomUUID()}`,
+    });
+    const approveResp = await fetch(
+      `${baseUrl}/api/plans/${encodeURIComponent(preview.planToken)}/approve`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+    );
+    expect(approveResp.status).toBe(200);
+    expect(((await approveResp.json()) as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("still serves a legitimate request whose Origin matches this server's own origin", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`, {
+      headers: { Origin: baseUrl },
+    });
+    expect(resp.status).toBe(200);
+  });
+
+  it("still serves a legitimate request with Sec-Fetch-Site: same-origin", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`, {
+      headers: { "Sec-Fetch-Site": "same-origin" },
+    });
+    expect(resp.status).toBe(200);
+  });
+
+  it("sets Cache-Control: no-store on both JSON and HTML responses", async () => {
+    const jsonResp = await fetch(`${baseUrl}/api/plans`);
+    expect(jsonResp.headers.get("cache-control")).toBe("no-store");
+
+    const htmlResp = await fetch(`${baseUrl}/`);
+    expect(htmlResp.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("returns 404, not 500, for a malformed percent-escape in the plan-token path segment", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans/%E0%A4%A/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
     expect(resp.status).toBe(404);
     const json = (await resp.json()) as { ok: boolean; code: string };
     expect(json.ok).toBe(false);

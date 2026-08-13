@@ -38,7 +38,18 @@ async function main(): Promise<void> {
 
   let approvalServer: ApprovalServerHandle | undefined;
   if (config.approvalServer.enabled) {
-    approvalServer = await startApprovalServer(write, config.approvalServer);
+    // Mirrors the distinct-role check above: a failure here (e.g. the
+    // configured port is already in use) is fatal, and must not leak the two
+    // pools already opened above before rethrowing.
+    try {
+      approvalServer = await startApprovalServer(write, config.approvalServer);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[sw-postgres-mcp] approval server failed to start: ${msg}`);
+      await pools.readonlyPool.end().catch(() => {});
+      await pools.writerPool.end().catch(() => {});
+      throw err;
+    }
     console.error(
       `[sw-postgres-mcp] localhost approval UI listening on http://${approvalServer.host}:${approvalServer.port}`,
     );

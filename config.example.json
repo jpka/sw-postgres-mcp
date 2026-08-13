@@ -19,5 +19,9 @@
     "approvalRequiredAboveRows": 100,
     "hardMaxRows": 10000
   },
+  "approvalServer": {
+    "enabled": true,
+    "port": 4319
+  },
   "callerId": "unknown"
 }

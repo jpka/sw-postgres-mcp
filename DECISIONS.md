@@ -5,6 +5,98 @@ were, what we picked, and the reasoning a reviewer can check. Newest first.
 
 ---
 
+## 2026-08-13 — Localhost approval UI: reject as a tombstone, pending-plan data stored on the token, one HTTP surface with no framework
+
+**Ticket:** #7 (localhost approval UI with approve and reject). Builds directly on the
+2026-08-13 / #6 entry below — same plan-token store, same "no separate approvals table"
+reasoning, same "not an MCP tool" security boundary, now extended to a symmetric reject.
+
+**Approach vs. #1's conclusion:** unchanged. #1 (see the 2026-08-12 entry below)
+concluded the out-of-band localhost page is the primary approval mechanism because no
+shipping client we target implements spec-native elicitation/MRTR yet. Nothing about
+that client-support situation changed by this ticket, so this page is built exactly as
+#1 anticipated — no divergence to record there.
+
+### Where the pending-plan data (statement, sample rows) lives
+
+`TokenEntry` (the in-memory record `TwoPhaseWrite.preview()` already creates per plan)
+previously stored only a fingerprint hash and a rows digest hash of the statement/params
+— enough to *verify* a later `execute_plan` call, but not enough to *display* the
+statement or sample rows again later. The localhost page needs to render both without
+re-running the preview (which would re-execute the statement inside a fresh
+transaction). Two options: (a) add `statement`, `params`, and `sampleRows` directly onto
+`TokenEntry`, or (b) stand up a second, parallel store keyed by `plan_token` just for
+display data. (a) was picked — it is one more field group next to the
+`requiresApproval`/`approved` flags the 2026-08-13/#6 entry below already put there,
+governed by the same lifecycle (created at preview, alive until used/expired/rejected),
+rather than a second data structure that could drift out of sync with the first. The
+memory cost is bounded by the same TTL and prune() sweep that already bounds the token
+store's size.
+
+### Reject semantics: a permanent tombstone, not a deletion
+
+"Permanently kills the token" (the ticket's own words) could mean either (a) delete the
+entry outright, so a later `execute_plan`/`approvePlan` call reports `UNKNOWN_TOKEN`, or
+(b) keep the entry with a `rejected` flag set, so those calls report a distinct
+`PLAN_REJECTED` instead. (b) was picked, for the acceptance criterion that matters most
+here: *"The agent receives a rejection as a structured error distinguishable from a
+timeout, an expiry, or a hard-cap refusal."* `UNKNOWN_TOKEN` already means "never issued
+or long gone" for three unrelated reasons (typo, stale token, server restart) — collapsing
+"a human looked at this and said no" into that same bucket would make the one outcome
+this ticket exists to make legible indistinguishable from an agent's-own bug. So:
+
+- `TokenStore.reject()` sets `entry.rejected = true` and (once) an optional
+  `rejectionReason`; it never deletes the entry.
+- `prune()` (which normally sweeps used/expired entries) explicitly skips rejected
+  entries, so a rejected token cannot silently age out into `UNKNOWN_TOKEN` before an
+  agent's retried `execute_plan` call reaches it.
+- Both `consume()` (backing `execute_plan`) and `approve()` check `entry.rejected` first
+  — ahead of used/expired/fingerprint checks — so rejection wins regardless of what else
+  is true about the call. This is also what makes "approving after rejecting" and
+  "rejecting twice" both safe: approve() on a rejected entry fails with `PLAN_REJECTED`
+  (never flips `approved`), and reject() on an already-rejected entry succeeds again
+  idempotently without changing anything.
+- The cost is that a rejected token's memory is never reclaimed by TTL alone — bounded
+  in practice (rejections are a human-paced, low-volume path; see #6's entry below on
+  bounding tombstone-style state by the same lifecycle as everything else), and
+  acceptable for a v1 whose plan-token store is already fully in-memory and
+  process-scoped with no persistence story beyond the audit log.
+
+### `approved_by` reused for "who rejected", no new migration
+
+The audit schema (`docker/init/02-audit-log.sql`) has one actor-identity column,
+`approved_by`, sized for `TwoPhaseWrite.approvePlan()`'s `approvedBy` argument.
+`rejectPlan()`'s `rejectedBy` argument is written into that same column rather than
+adding a `rejected_by` column that would sit next to it doing the identical job — the
+column already means "who actioned this token," not narrowly "who approved this token,"
+and a second column with the same shape and purpose would only exist to satisfy a naming
+mismatch, not a real distinction. `docker/init/03-approval-workflow.sql` (ticket #6)
+already extended `mcp_audit.log.status`'s `CHECK` constraint to include `rejected`
+in anticipation of this ticket, so no new migration was needed for #7 at all.
+
+### One local HTTP server, `node:http`, no new dependency
+
+The page is server-rendered plain HTML with a small inline `<script>` doing two
+`fetch()` calls (approve/reject) and reloading — the ticket explicitly asks to resist
+making this a React app ("a form with two buttons"). Built on Node's built-in `http`
+module rather than adding Express or similar: the whole surface is four routes (`GET /`,
+`GET /api/plans`, `POST /api/plans/:token/approve`, `POST /api/plans/:token/reject`), and
+the project has otherwise stayed dependency-light (`pg`, `zod`, the MCP SDK). The JSON
+API (`GET /api/plans` and the two POST actions) exists as a first-class surface, not an
+implementation detail behind the HTML — it is what `tests/approvalUi.test.ts` drives
+directly with plain `fetch()`, matching the ticket's own guidance that no browser
+automation is needed to verify this.
+
+The server binds to `127.0.0.1` unconditionally — `src/approvalServer.ts` hardcodes the
+host, and `config.approvalServer` (src/config.ts) only exposes `enabled`/`port`, no host
+override — so there is no configuration path that could accidentally expose it on
+`0.0.0.0`. `src/index.ts` constructs one `TwoPhaseWrite` instance and shares it between
+`startServer` (the MCP stdio transport) and `startApprovalServer`, so an approval or
+rejection is visible to `execute_plan` in the same process without any new
+inter-process channel.
+
+---
+
 ## 2026-08-13 — Approval mechanism's shape: a flag on the plan token, no separate approvals table
 
 **Ticket:** #6 (approval threshold, hard row cap, `awaiting_approval`). Read by: #7

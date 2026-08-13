@@ -352,8 +352,20 @@ export function createServer(
   return server;
 }
 
-export async function startServer(pools: Pools, config: AppConfig): Promise<void> {
-  const server = createServer(pools, config);
+/**
+ * `write` is optional here too, for the same reason as `createServer`'s own
+ * default: `index.ts`'s `main()` constructs one `TwoPhaseWrite` explicitly
+ * and shares it with the localhost approval server (src/approvalServer.ts)
+ * so an approval/rejection there is visible to `execute_plan` in this same
+ * process. Tests that only need the MCP surface can omit it and get the
+ * same default `createServer` would build on its own.
+ */
+export async function startServer(
+  pools: Pools,
+  config: AppConfig,
+  write?: TwoPhaseWrite,
+): Promise<void> {
+  const server = createServer(pools, config, write);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

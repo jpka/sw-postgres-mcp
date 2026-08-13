@@ -2,6 +2,8 @@
 import { loadConfig } from "./config.js";
 import { createPools, assertRolesDistinct } from "./db.js";
 import { startServer } from "./server.js";
+import { TwoPhaseWrite } from "./writeCore.js";
+import { startApprovalServer, type ApprovalServerHandle } from "./approvalServer.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -20,7 +22,30 @@ async function main(): Promise<void> {
     throw err;
   }
 
+  // Constructed once and shared between the MCP stdio server and the
+  // localhost approval HTTP server below, so an approve/reject there is
+  // visible to execute_plan here — both run against the same in-memory plan
+  // token store (see DECISIONS.md: approval is scoped to the process that
+  // issued the preview).
+  const write = new TwoPhaseWrite({
+    pool: pools.writerPool,
+    planTtlMs: config.write.planTtlMs,
+    statementTimeoutMs: config.write.statementTimeoutMs,
+    approvalRequiredAboveRows: config.write.approvalRequiredAboveRows,
+    hardMaxRows: config.write.hardMaxRows,
+    callerId: config.callerId,
+  });
+
+  let approvalServer: ApprovalServerHandle | undefined;
+  if (config.approvalServer.enabled) {
+    approvalServer = await startApprovalServer(write, config.approvalServer);
+    console.error(
+      `[sw-postgres-mcp] localhost approval UI listening on http://${approvalServer.host}:${approvalServer.port}`,
+    );
+  }
+
   const onExit = async () => {
+    await approvalServer?.close().catch(() => {});
     await pools.readonlyPool.end().catch(() => {});
     await pools.writerPool.end().catch(() => {});
     process.exit(0);
@@ -28,7 +53,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", onExit);
   process.on("SIGTERM", onExit);
 
-  await startServer(pools, config);
+  await startServer(pools, config, write);
 }
 
 main().catch((err) => {

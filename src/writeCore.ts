@@ -13,7 +13,8 @@ export type WriteErrorCode =
   | "TABLE_NOT_WRITABLE"
   | "INVALID_TABLE_NAME"
   | "AWAITING_APPROVAL"
-  | "HARD_MAX_ROWS_EXCEEDED";
+  | "HARD_MAX_ROWS_EXCEEDED"
+  | "PLAN_REJECTED";
 
 export class WriteError extends Error {
   readonly code: WriteErrorCode;
@@ -45,6 +46,25 @@ export interface WritePreview {
 
 export interface ExecuteResult {
   affectedRows: number;
+}
+
+/**
+ * One awaiting_approval plan, shaped for a human approval surface (ticket
+ * #7's localhost UI): everything it needs to render a card — the exact
+ * statement, the agent's stated reason, the exact preview row count, and the
+ * sample rows from the preview — without giving it a raw `TokenEntry`.
+ * Returned by `TwoPhaseWrite.listPendingPlans()`.
+ */
+export interface PendingPlan {
+  planToken: string;
+  tool: string;
+  reason: string | null;
+  statement: string;
+  params: readonly unknown[];
+  previewRows: number;
+  sampleRows: unknown[];
+  expiresAt: number;
+  callerId: string;
 }
 
 export interface TwoPhaseWriteOptions {
@@ -97,6 +117,20 @@ interface TokenEntry extends TokenMeta {
   requiresApproval: boolean;
   /** Always true when !requiresApproval; flipped by TokenStore.approve() otherwise. */
   approved: boolean;
+  /**
+   * True once TokenStore.reject() has been called. A permanent tombstone:
+   * once set, this entry is never deleted by prune()'s expiry sweep, never
+   * approvable, and consume()/approve() report PLAN_REJECTED for it ahead of
+   * every other check (used, expired, fingerprint), regardless of how much
+   * later execute_plan or approvePlan is called against it.
+   */
+  rejected: boolean;
+  /** Human-supplied rejection reason, surfaced back to the agent's next execute_plan attempt. */
+  rejectionReason: string | null;
+  /** The exact statement/params/sample rows from the preview — kept so listPending() can render a full card without re-running the preview. */
+  statement: string;
+  params: readonly unknown[];
+  sampleRows: unknown[];
 }
 
 /**
@@ -125,6 +159,17 @@ type ApproveResult =
   | { ok: true; alreadyApproved: boolean; meta: TokenMeta }
   | { ok: false; error: WriteError; meta?: TokenMeta };
 
+type RejectResult =
+  | { ok: true; alreadyRejected: boolean; meta: TokenMeta }
+  | { ok: false; error: WriteError; meta?: TokenMeta };
+
+/** The exact statement/params/sample rows a preview produced, kept on the token so a human approval surface can render them later without re-running the preview. */
+interface PlanData {
+  statement: string;
+  params: readonly unknown[];
+  sampleRows: unknown[];
+}
+
 class TokenStore {
   private tokens = new Map<string, TokenEntry>();
 
@@ -135,6 +180,7 @@ class TokenStore {
     rowsDigest: string,
     meta: TokenMeta,
     requiresApproval: boolean,
+    planData: PlanData,
   ): string {
     this.prune();
     const token = randomBytes(24).toString("hex");
@@ -145,9 +191,45 @@ class TokenStore {
       used: false,
       requiresApproval,
       approved: !requiresApproval,
+      rejected: false,
+      rejectionReason: null,
+      statement: planData.statement,
+      params: planData.params,
+      sampleRows: planData.sampleRows,
       ...meta,
     });
     return token;
+  }
+
+  /**
+   * Plans still awaiting a human decision: requiresApproval, not yet
+   * approved, not used, not rejected, and not expired. Expired entries are
+   * deliberately omitted rather than flagged stale — ticket #7's acceptance
+   * criteria calls for an expired plan to disappear from the pending list,
+   * not sit there approvable.
+   */
+  listPending(): PendingPlan[] {
+    const now = Date.now();
+    const out: PendingPlan[] = [];
+    for (const [token, entry] of this.tokens) {
+      if (!entry.requiresApproval) continue;
+      if (entry.approved || entry.used || entry.rejected) continue;
+      if (now > entry.expiresAt) continue;
+      out.push({
+        planToken: token,
+        tool: entry.tool,
+        reason: entry.reason,
+        statement: entry.statement,
+        params: entry.params,
+        previewRows: entry.previewRows,
+        sampleRows: entry.sampleRows,
+        expiresAt: entry.expiresAt,
+        callerId: entry.callerId,
+      });
+    }
+    // Soonest-expiring first — the plans a human needs to act on most urgently lead the list.
+    out.sort((a, b) => a.expiresAt - b.expiresAt);
+    return out;
   }
 
   /**
@@ -176,6 +258,17 @@ class TokenStore {
         ),
       };
     }
+    if (entry.rejected) {
+      return {
+        ok: false,
+        error: new WriteError(
+          "PLAN_REJECTED",
+          "This plan was rejected by a human reviewer and cannot be approved.",
+          "A rejected plan cannot be un-rejected. Narrow the statement and re-preview to get a fresh token.",
+        ),
+        meta,
+      };
+    }
     if (entry.used) {
       return {
         ok: false,
@@ -202,6 +295,70 @@ class TokenStore {
     return { ok: true, alreadyApproved, meta: meta! };
   }
 
+  /**
+   * Permanently kills a plan token: it can never be approved or executed
+   * afterward, no matter what is later done to it. Unlike approve()/consume()
+   * this does not delete the entry from the map — it stays as a tombstone
+   * (see the `rejected` field's doc comment) so a later execute_plan or
+   * approvePlan call reports the distinguishable PLAN_REJECTED error instead
+   * of falling through to a generic UNKNOWN_TOKEN once enough time has
+   * passed. Idempotent: rejecting an already-rejected token succeeds again
+   * without changing anything (alreadyRejected: true), so "reject twice" is
+   * harmless rather than an error a human approval UI has to guard against.
+   */
+  reject(token: string, reason: string | null): RejectResult {
+    const entry = this.tokens.get(token);
+    const meta: TokenMeta | undefined = entry
+      ? {
+          tool: entry.tool,
+          reason: entry.reason,
+          callerId: entry.callerId,
+          previewRows: entry.previewRows,
+        }
+      : undefined;
+
+    if (!entry) {
+      return {
+        ok: false,
+        error: new WriteError(
+          "UNKNOWN_TOKEN",
+          "No plan matches this token. It may have been revoked or never issued.",
+        ),
+      };
+    }
+    if (entry.used) {
+      return {
+        ok: false,
+        error: new WriteError(
+          "USED_TOKEN",
+          "This plan token was already executed and can no longer be rejected.",
+        ),
+        meta,
+      };
+    }
+    // Skip the expiry check once already rejected: an already-dead token
+    // must stay reported as PLAN_REJECTED forever, not flip to EXPIRED_TOKEN
+    // (and get pruned) just because enough wall-clock time passed between
+    // two reject() calls.
+    if (!entry.rejected && Date.now() > entry.expiresAt) {
+      this.tokens.delete(token);
+      return {
+        ok: false,
+        error: new WriteError(
+          "EXPIRED_TOKEN",
+          "This plan token has already expired. There is nothing left to reject.",
+        ),
+        meta,
+      };
+    }
+    const alreadyRejected = entry.rejected;
+    entry.rejected = true;
+    // First reason wins: a second reject() call (or one that omits a reason)
+    // does not overwrite the reason a human already gave.
+    if (!entry.rejectionReason && reason) entry.rejectionReason = reason;
+    return { ok: true, alreadyRejected, meta: meta! };
+  }
+
   consume(token: string, fingerprint: string): ConsumeResult {
     const entry = this.tokens.get(token);
     // Captured before any mutation below, so a failure path can still audit
@@ -223,6 +380,23 @@ class TokenStore {
           "UNKNOWN_TOKEN",
           "No plan matches this token. It may have been revoked or never issued.",
         ),
+      };
+    }
+    // Checked ahead of used/expired/fingerprint: rejection is a permanent
+    // kill, so it must win regardless of what else is true about the token
+    // (including a statement/params that no longer even matches — there is
+    // no scenario in which a rejected token should report anything else).
+    if (entry.rejected) {
+      return {
+        ok: false,
+        error: new WriteError(
+          "PLAN_REJECTED",
+          entry.rejectionReason
+            ? `This plan was rejected by a human reviewer: ${entry.rejectionReason}`
+            : "This plan was rejected by a human reviewer.",
+          "This plan cannot be executed. Narrow the statement (or ask a different question) and call delete_rows again for a fresh preview and token.",
+        ),
+        meta,
       };
     }
     if (entry.used) {
@@ -279,6 +453,11 @@ class TokenStore {
   private prune(): void {
     const now = Date.now();
     for (const [token, entry] of this.tokens) {
+      // Rejected entries are deliberately exempt from the expiry sweep —
+      // they are kept as tombstones (see reject()'s doc comment) so a late
+      // execute_plan/approvePlan call still reports PLAN_REJECTED instead of
+      // falling back to UNKNOWN_TOKEN once enough time has passed.
+      if (entry.rejected) continue;
       if (entry.used || now > entry.expiresAt) {
         this.tokens.delete(token);
       }
@@ -380,6 +559,7 @@ export class TwoPhaseWrite {
         row.rows_digest,
         { tool: meta.tool, reason, callerId: this.callerId, previewRows: affectedRows },
         requiresApproval,
+        { statement, params, sampleRows },
       );
 
       // Recorded on the same connection, after ROLLBACK has ended the preview
@@ -585,6 +765,84 @@ export class TwoPhaseWrite {
       durationMs: Date.now() - startedAt,
       callerId: meta.callerId,
     });
+  }
+
+  /**
+   * Permanently kills a plan token: it can never be approved or executed
+   * afterward, and `execute` reports the distinguishable `PLAN_REJECTED`
+   * error for it (not a generic failure) — see TokenStore.reject()'s doc
+   * comment for why the token stays around as a tombstone rather than being
+   * deleted outright. This is the symmetric counterpart to `approvePlan()`:
+   * ticket #7's localhost approval page calls this directly for its Reject
+   * button, the same (deliberately non-MCP-tool) way it calls `approvePlan`
+   * for Approve.
+   *
+   * `reason` is optional human-readable text (e.g. "too broad, narrow the
+   * WHERE clause") that gets folded into the WriteError message the agent's
+   * next `execute_plan` attempt receives, so the agent has something to act
+   * on rather than an opaque refusal. `rejectedBy` is recorded on the audit
+   * row's `approved_by` column — reused here as the generic "who actioned
+   * this token" identity field rather than adding a migration for a
+   * `rejected_by` column that would otherwise sit next to it doing the exact
+   * same job (see DECISIONS.md).
+   *
+   * Idempotent: rejecting an already-rejected token succeeds again without
+   * error and without changing anything.
+   */
+  async rejectPlan(
+    planToken: string,
+    reason: string | null = null,
+    rejectedBy: string | null = null,
+  ): Promise<void> {
+    const startedAt = Date.now();
+    const result = this.store.reject(planToken, reason);
+    const meta: TokenMeta =
+      result.meta ?? { tool: "reject_plan", reason: null, callerId: this.callerId, previewRows: NaN };
+    const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
+
+    if (!result.ok) {
+      await this.auditLog.record({
+        tool: meta.tool,
+        reason: meta.reason,
+        statement: "",
+        params: [],
+        previewRows,
+        actualRows: null,
+        planToken,
+        approvedBy: rejectedBy,
+        status: "failed",
+        durationMs: Date.now() - startedAt,
+        callerId: meta.callerId,
+      });
+      throw result.error;
+    }
+
+    await this.auditLog.record({
+      tool: "reject_plan",
+      reason: meta.reason,
+      statement: "",
+      params: [],
+      previewRows,
+      actualRows: null,
+      planToken,
+      approvedBy: rejectedBy ?? "unknown",
+      status: "rejected",
+      durationMs: Date.now() - startedAt,
+      callerId: meta.callerId,
+    });
+  }
+
+  /**
+   * Plans currently awaiting a human decision — requiresApproval, not yet
+   * approved, not used, not rejected, not expired — with the exact
+   * statement, reason, preview row count, and sample rows a human approval
+   * surface (ticket #7) needs to render a card per plan. Deliberately not an
+   * MCP tool: this is read access to the same out-of-band surface
+   * `approvePlan`/`rejectPlan` already are, not something the requesting
+   * agent needs (or should get) a live view of.
+   */
+  listPendingPlans(): PendingPlan[] {
+    return this.store.listPending();
   }
 
   private previewSql(statement: string): string {

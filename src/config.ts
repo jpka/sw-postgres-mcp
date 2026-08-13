@@ -47,10 +47,36 @@ export const DEFAULT_WRITE_CONFIG: WriteConfig = {
   hardMaxRows: 10_000,
 };
 
+export interface ApprovalServerConfig {
+  /**
+   * Whether the localhost human-approval HTTP server (ticket #7) starts
+   * alongside the MCP stdio server. Default true — this is the whole
+   * approval mechanism's UI; running without it means an awaiting_approval
+   * plan can never be approved or rejected. Overridable with
+   * `SW_APPROVAL_SERVER_ENABLED` (env takes precedence over config file).
+   */
+  enabled: boolean;
+  /**
+   * Port the localhost approval server listens on, bound to 127.0.0.1 only
+   * (never 0.0.0.0 — see DECISIONS.md and src/approvalServer.ts). The bind
+   * address is not configurable on purpose: this surface calls
+   * `TwoPhaseWrite.approvePlan()`/`rejectPlan()` directly, and must stay
+   * unreachable from anywhere but the machine the server runs on. Default
+   * 4319. Overridable with `SW_APPROVAL_SERVER_PORT`.
+   */
+  port: number;
+}
+
+export const DEFAULT_APPROVAL_SERVER_CONFIG: ApprovalServerConfig = {
+  enabled: true,
+  port: 4319,
+};
+
 export interface AppConfig {
   database: DatabaseConfig;
   allowlist: AllowlistConfig;
   write: WriteConfig;
+  approvalServer: ApprovalServerConfig;
   /**
    * Identity recorded as `caller_id` on every mcp_audit.log row this server
    * instance writes. The server has no per-request authentication (see
@@ -134,8 +160,13 @@ export function loadConfig(configPath?: string): AppConfig {
   const dbRaw = (r.database ?? {}) as Record<string, unknown>;
   const allowRaw = (r.allowlist ?? {}) as Record<string, unknown>;
   const writeRaw = (r.write ?? {}) as Record<string, unknown>;
+  const approvalServerRaw = (r.approvalServer ?? {}) as Record<string, unknown>;
 
-  const positiveIntOrThrow = (value: unknown, setting: string): number | undefined => {
+  const positiveIntOrThrow = (
+    value: unknown,
+    setting: string,
+    section = "write",
+  ): number | undefined => {
     if (value === undefined || value === null || value === "") return undefined;
     if (typeof value === "number") {
       if (Number.isInteger(value) && value > 0) return value;
@@ -144,7 +175,19 @@ export function loadConfig(configPath?: string): AppConfig {
       if (Number.isSafeInteger(n) && n > 0) return n;
     }
     throw new Error(
-      `write.${setting} must be a positive integer, got ${JSON.stringify(value)}`,
+      `${section}.${setting} must be a positive integer, got ${JSON.stringify(value)}`,
+    );
+  };
+
+  const boolOrThrow = (value: unknown, setting: string, section: string): boolean | undefined => {
+    if (value === undefined || value === null || value === "") return undefined;
+    if (typeof value === "boolean") return value;
+    if (typeof value === "string") {
+      if (value === "true") return true;
+      if (value === "false") return false;
+    }
+    throw new Error(
+      `${section}.${setting} must be a boolean ("true"/"false"), got ${JSON.stringify(value)}`,
     );
   };
 
@@ -175,6 +218,23 @@ export function loadConfig(configPath?: string): AppConfig {
       `write.hardMaxRows (${write.hardMaxRows}) must be >= write.approvalRequiredAboveRows (${write.approvalRequiredAboveRows})`,
     );
   }
+
+  const approvalServerPort =
+    positiveIntOrThrow(process.env.SW_APPROVAL_SERVER_PORT, "port", "approvalServer") ??
+    positiveIntOrThrow(approvalServerRaw.port, "port", "approvalServer") ??
+    DEFAULT_APPROVAL_SERVER_CONFIG.port;
+  if (approvalServerPort > 65_535) {
+    throw new Error(
+      `approvalServer.port must be a valid TCP port (1-65535), got ${approvalServerPort}`,
+    );
+  }
+  const approvalServer: ApprovalServerConfig = {
+    enabled:
+      boolOrThrow(process.env.SW_APPROVAL_SERVER_ENABLED, "enabled", "approvalServer") ??
+      boolOrThrow(approvalServerRaw.enabled, "enabled", "approvalServer") ??
+      DEFAULT_APPROVAL_SERVER_CONFIG.enabled,
+    port: approvalServerPort,
+  };
 
   // Allowlist supports both nested {read, write} and legacy flat keys for backwards compat
   let allowlist: AllowlistConfig;
@@ -245,5 +305,5 @@ export function loadConfig(configPath?: string): AppConfig {
       : undefined) ??
     "unknown";
 
-  return { database, allowlist, write, callerId };
+  return { database, allowlist, write, approvalServer, callerId };
 }

@@ -342,7 +342,7 @@ export function createServer(
       {
         name: "execute_plan",
         description:
-          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the preview (delete_rows, insert_rows, or update_rows). The token is single-use, expires, refuses any statement that does not match the preview, refuses to commit if the affected row set changed since the preview, and — if the preview's affected-row count was above write.approvalRequiredAboveRows — refuses until a human approves it through an out-of-band approval surface (not available through this MCP tool set).",
+          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the preview (delete_rows, insert_rows, or update_rows). The token is single-use, expires, and refuses any statement that does not match the preview. For delete_rows and update_rows, it also refuses to commit if the affected row set changed since the preview; insert_rows has no matching row set to compare (a rolled-back preview insert still consumes sequence values), so it relies on the token's fingerprint, single-use, and expiry guarantees instead. If the preview's affected-row count was above write.approvalRequiredAboveRows, execution refuses until a human approves it through an out-of-band approval surface (not available through this MCP tool set).",
         inputSchema: {
           type: "object",
           properties: {

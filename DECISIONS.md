@@ -47,10 +47,12 @@ occasionally trip on genuine concurrent activity.
 
 Fix (in `writeCore.ts`, not worked around per-tool): `execute()` now skips the digest
 equality check when the statement is an INSERT (`isInsertStatement()`, a leading-
-keyword check — safe because every statement this core ever sees is built by this
-project's own `src/tools/*.ts`, never passed through from arbitrary agent SQL). The
-digest is still computed and stored either way (no separate code path in the SQL
-itself); only the comparison is conditional. What INSERT still gets from the core,
+keyword check). `execute_plan` does receive `statement`/`params` back from the agent —
+they aren't confined to `src/tools/*.ts` — but `TokenStore.consume()` recomputes
+`statementFingerprint(statement, params)` and rejects any mismatch before execution, so
+`isInsertStatement()` only ever runs against the exact statement that was previewed,
+never an agent-substituted one. The digest is still computed and stored either way (no
+separate code path in the SQL itself); only the comparison is conditional. What INSERT still gets from the core,
 unchanged: preview-then-rollback with an exact count and RETURNING sample,
 `statementFingerprint` binding the token to the exact statement + params (so
 execute_plan cannot be tricked into inserting something other than what was

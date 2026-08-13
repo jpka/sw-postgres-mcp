@@ -298,7 +298,7 @@ describe("update_rows (#8)", () => {
     expect(stored).toBe(maliciousValue);
   });
 
-  it("AC7: preview, execute, and a refused no-WHERE attempt are all audited with the reason", async () => {
+  it("AC7: preview and execute are audited with the reason; a refused no-WHERE attempt never reaches the audit log", async () => {
     const reason = `update-audit-${randomUUID()}`;
 
     const refused = await client.callTool({

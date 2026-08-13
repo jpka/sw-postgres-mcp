@@ -75,14 +75,18 @@ Integration tests verify against a live Postgres: role separation, readonly cann
 ## Tools
 
 - `describe_schema` — tables, columns with types, foreign keys, row-count estimates (respects read allowlist).
+- `query` — run a read-only `SELECT` and return `{ columns, rows, row_count }`. Runs on the readonly role, so a mutating statement is refused by the database regardless of what the SQL says. Enforces a single statement per call and the read allowlist. Optional `limit` and `params`.
+- `explain_plan` — run `EXPLAIN (FORMAT JSON)` for a candidate read statement and return the planner's estimated `cost` and `rows` without executing it. A cheap pre-check before running something potentially expensive.
 - `delete_rows` — **two-phase delete**. Runs the statement inside a transaction, returns the exact affected row count plus a sample of affected rows, then rolls back. The response includes a `plan_token`, the exact `statement`, and `params`.
 - `execute_plan` — commits a previously previewed write. Pass back the `plan_token`, `statement`, and `params` from the preview response.
+
+Every tool takes a `reason` string (recorded in the audit log in a later slice) and returns errors as structured `{ code, message, hint }` — never a raw Postgres exception or a multi-statement batch.
 
 ### Two-phase writes
 
 The agent must commit to a preview before it can execute:
 
 1. `delete_rows` runs the statement in a transaction, captures the exact affected row count and a sample of affected rows via `RETURNING`, then **rolls back**. Nothing has changed in the database.
-2. `execute_plan` replays the identical statement and commits — but only if the token is valid, unexpired, unused, and bound to the exact statement + params from the preview.
+2. `execute_plan` replays the identical statement and commits — but only if the token is valid, unexpired, unused, bound to the exact statement + params from the preview, and the affected row set still matches the preview.
 
 A `DELETE` without a `WHERE` clause is refused unless `confirm_full_table: true` is passed. Every write runs through the `writer` pool; the `readonly` pool is never used for a mutation.

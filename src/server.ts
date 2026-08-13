@@ -8,8 +8,30 @@ import { z } from "zod";
 import type { Pools } from "./db.js";
 import type { AppConfig } from "./config.js";
 import { describeSchema } from "./tools/describeSchema.js";
+import { runQuery } from "./tools/query.js";
+import { explainPlan } from "./tools/explainPlan.js";
 import { previewDeleteRows } from "./tools/deleteRows.js";
+import { ToolFailure } from "./tools/errors.js";
 import { TwoPhaseWrite, WriteError } from "./writeCore.js";
+
+const paramValue = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+
+const queryArgsSchema = z
+  .object({
+    statement: z.string().min(1),
+    params: z.array(paramValue).optional(),
+    limit: z.number().int().positive().optional(),
+    reason: z.string().min(1),
+  })
+  .strict();
+
+const explainArgsSchema = z
+  .object({
+    statement: z.string().min(1),
+    params: z.array(paramValue).optional(),
+    reason: z.string().min(1),
+  })
+  .strict();
 
 const deleteRowsSchema = z.object({
   table: z.string(),
@@ -24,6 +46,56 @@ const executePlanSchema = z.object({
   statement: z.string(),
   params: z.array(z.unknown()).optional(),
 });
+
+function text(content: string) {
+  return { content: [{ type: "text", text: content }] as const };
+}
+
+function errorBody(err: unknown) {
+  if (err instanceof WriteError) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            code: err.code,
+            message: err.message,
+            hint: err.hint ?? null,
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+  const shape =
+    err instanceof ToolFailure
+      ? err.toJSON()
+      : {
+          code: "INTERNAL_ERROR",
+          message: "Unexpected server error.",
+          hint: "Retry the call; if it persists, check the server logs.",
+        };
+  return { content: [{ type: "text", text: JSON.stringify(shape) }], isError: true };
+}
+
+function invalidArguments(error: z.ZodError) {
+  const details = error.issues
+    .map((issue) => `${issue.path.join(".") || "arguments"}: ${issue.message}`)
+    .join("; ");
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          code: "INVALID_ARGUMENTS",
+          message: `Invalid arguments: ${details}`,
+          hint: "Check the tool's input schema and retry.",
+        }),
+      },
+    ],
+    isError: true,
+  };
+}
 
 export function createServer(pools: Pools, config: AppConfig): Server {
   const server = new Server(
@@ -53,6 +125,48 @@ export function createServer(pools: Pools, config: AppConfig): Server {
         inputSchema: {
           type: "object",
           properties: {},
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "query",
+        description:
+          "Run a read-only SELECT against the database and return the rows. Runs on the readonly role, so mutating statements are refused by the database. Respects the read allowlist in config. Takes a `reason` string.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            statement: { type: "string", description: "A single SELECT statement." },
+            params: {
+              type: "array",
+              items: { type: ["string", "number", "boolean", "null"] },
+              description: "Positional parameters for the statement ($1, $2, ...).",
+            },
+            limit: {
+              type: "number",
+              description: "Optional maximum number of rows to return.",
+            },
+            reason: { type: "string", description: "Why this statement is being run." },
+          },
+          required: ["statement", "reason"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "explain_plan",
+        description:
+          "Return the planner's estimated cost and row count for a candidate read statement, without executing it. A cheap pre-check to reject obviously expensive statements before running them. Takes a `reason` string.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            statement: { type: "string", description: "A single read statement to estimate." },
+            params: {
+              type: "array",
+              items: { type: ["string", "number", "boolean", "null"] },
+              description: "Positional parameters for the statement ($1, $2, ...).",
+            },
+            reason: { type: "string", description: "Why this statement is being estimated." },
+          },
+          required: ["statement", "reason"],
           additionalProperties: false,
         },
       },
@@ -92,7 +206,7 @@ export function createServer(pools: Pools, config: AppConfig): Server {
       {
         name: "execute_plan",
         description:
-          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the delete_rows preview. The token is single-use, expires, and refuses any statement that does not match the preview.",
+          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the delete_rows preview. The token is single-use, expires, refuses any statement that does not match the preview, and refuses to commit if the affected row set changed since the preview.",
         inputSchema: {
           type: "object",
           properties: {
@@ -119,33 +233,47 @@ export function createServer(pools: Pools, config: AppConfig): Server {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name } = request.params;
+    const args = request.params.arguments ?? {};
 
     if (name === "describe_schema") {
-      const parsed = z
-        .object({})
-        .passthrough()
-        .safeParse(request.params.arguments ?? {});
-      if (!parsed.success) {
-        return invalidArgs(parsed.error.message);
-      }
-
+      const parsed = z.object({}).passthrough().safeParse(args);
+      if (!parsed.success) return invalidArguments(parsed.error);
       try {
         const tables = await describeSchema(pools.readonlyPool, config);
-        return textResult(JSON.stringify({ tables }, null, 2));
+        return text(JSON.stringify({ tables }, null, 2));
       } catch (err) {
-        return failure(name, err);
+        return errorBody(err);
+      }
+    }
+
+    if (name === "query") {
+      const parsed = queryArgsSchema.safeParse(args);
+      if (!parsed.success) return invalidArguments(parsed.error);
+      try {
+        const result = await runQuery(pools.readonlyPool, parsed.data, config);
+        return text(JSON.stringify(result, null, 2));
+      } catch (err) {
+        return errorBody(err);
+      }
+    }
+
+    if (name === "explain_plan") {
+      const parsed = explainArgsSchema.safeParse(args);
+      if (!parsed.success) return invalidArguments(parsed.error);
+      try {
+        const result = await explainPlan(pools.readonlyPool, parsed.data, config);
+        return text(JSON.stringify(result, null, 2));
+      } catch (err) {
+        return errorBody(err);
       }
     }
 
     if (name === "delete_rows") {
-      const parsed = deleteRowsSchema.safeParse(request.params.arguments ?? {});
-      if (!parsed.success) {
-        return invalidArgs(parsed.error.message);
-      }
-
+      const parsed = deleteRowsSchema.safeParse(args);
+      if (!parsed.success) return invalidArguments(parsed.error);
       try {
         const preview = await previewDeleteRows(write, config, parsed.data);
-        return textResult(
+        return text(
           JSON.stringify(
             {
               status: "previewed",
@@ -160,23 +288,20 @@ export function createServer(pools: Pools, config: AppConfig): Server {
           ),
         );
       } catch (err) {
-        return failure(name, err);
+        return errorBody(err);
       }
     }
 
     if (name === "execute_plan") {
-      const parsed = executePlanSchema.safeParse(request.params.arguments ?? {});
-      if (!parsed.success) {
-        return invalidArgs(parsed.error.message);
-      }
-
+      const parsed = executePlanSchema.safeParse(args);
+      if (!parsed.success) return invalidArguments(parsed.error);
       try {
         const result = await write.execute(
           parsed.data.plan_token,
           parsed.data.statement,
           parsed.data.params ?? [],
         );
-        return textResult(
+        return text(
           JSON.stringify(
             { status: "executed", affected_rows: result.affectedRows },
             null,
@@ -184,51 +309,20 @@ export function createServer(pools: Pools, config: AppConfig): Server {
           ),
         );
       } catch (err) {
-        return failure(name, err);
+        return errorBody(err);
       }
     }
 
-    return {
-      content: [{ type: "text", text: `Unknown tool: ${name}` }],
-      isError: true,
-    };
+    return errorBody(
+      new ToolFailure(
+        "UNKNOWN_TOOL",
+        `Unknown tool: ${name}`,
+        "List available tools and retry with a known tool name.",
+      ),
+    );
   });
 
   return server;
-}
-
-function textResult(text: string) {
-  return { content: [{ type: "text", text }] };
-}
-
-function invalidArgs(message: string) {
-  return {
-    content: [{ type: "text", text: `Invalid arguments: ${message}` }],
-    isError: true,
-  };
-}
-
-function failure(tool: string, err: unknown) {
-  if (err instanceof WriteError) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            { code: err.code, message: err.message, hint: err.hint ?? null },
-            null,
-            2,
-          ),
-        },
-      ],
-      isError: true,
-    };
-  }
-  const message = err instanceof Error ? err.message : String(err);
-  return {
-    content: [{ type: "text", text: `${tool} failed: ${message}` }],
-    isError: true,
-  };
 }
 
 export async function startServer(pools: Pools, config: AppConfig): Promise<void> {

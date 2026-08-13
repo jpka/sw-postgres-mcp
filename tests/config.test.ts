@@ -123,6 +123,9 @@ describe("write timing config", () => {
     expect(() => loadConfig(writeTempConfig({ write: { planTtlMs: 1.5 } }))).toThrow(
       /planTtlMs/,
     );
+    expect(() =>
+      loadConfig(writeTempConfig({ write: { planTtlMs: "1.5" } })),
+    ).toThrow(/planTtlMs/);
   });
 
   it("rejects zero or negative statementTimeoutMs", () => {
@@ -144,6 +147,10 @@ describe("write timing config", () => {
       process.env.SW_PLAN_TTL_MS = "0";
       expect(() => loadConfig()).toThrow(/planTtlMs/);
       process.env.SW_PLAN_TTL_MS = "-5";
+      expect(() => loadConfig()).toThrow(/planTtlMs/);
+      process.env.SW_PLAN_TTL_MS = "1.5";
+      expect(() => loadConfig()).toThrow(/planTtlMs/);
+      process.env.SW_PLAN_TTL_MS = "12ms";
       expect(() => loadConfig()).toThrow(/planTtlMs/);
       delete process.env.SW_PLAN_TTL_MS;
       process.env.SW_STATEMENT_TIMEOUT_MS = "0";

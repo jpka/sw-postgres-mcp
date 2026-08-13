@@ -111,8 +111,13 @@ export function loadConfig(configPath?: string): AppConfig {
   const writeRaw = (r.write ?? {}) as Record<string, unknown>;
 
   const positiveIntOrThrow = (value: unknown, setting: string): number | undefined => {
-    if (value === undefined || value === null) return undefined;
-    if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
+    if (value === undefined || value === null || value === "") return undefined;
+    if (typeof value === "number") {
+      if (Number.isInteger(value) && value > 0) return value;
+    } else if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+      const n = Number(value);
+      if (Number.isSafeInteger(n) && n > 0) return n;
+    }
     throw new Error(
       `write.${setting} must be a positive integer, got ${JSON.stringify(value)}`,
     );
@@ -120,11 +125,11 @@ export function loadConfig(configPath?: string): AppConfig {
 
   const write: WriteConfig = {
     planTtlMs:
-      positiveIntOrThrow(parseIntSafe(process.env.SW_PLAN_TTL_MS), "planTtlMs") ??
+      positiveIntOrThrow(process.env.SW_PLAN_TTL_MS, "planTtlMs") ??
       positiveIntOrThrow(writeRaw.planTtlMs, "planTtlMs") ??
       DEFAULT_WRITE_CONFIG.planTtlMs,
     statementTimeoutMs:
-      positiveIntOrThrow(parseIntSafe(process.env.SW_STATEMENT_TIMEOUT_MS), "statementTimeoutMs") ??
+      positiveIntOrThrow(process.env.SW_STATEMENT_TIMEOUT_MS, "statementTimeoutMs") ??
       positiveIntOrThrow(writeRaw.statementTimeoutMs, "statementTimeoutMs") ??
       DEFAULT_WRITE_CONFIG.statementTimeoutMs,
   };
@@ -192,10 +197,4 @@ export function loadConfig(configPath?: string): AppConfig {
   }
 
   return { database, allowlist, write };
-}
-
-function parseIntSafe(value: string | undefined): number | undefined {
-  if (value === undefined || value === "") return undefined;
-  const n = Number.parseInt(value, 10);
-  return Number.isFinite(n) ? n : undefined;
 }

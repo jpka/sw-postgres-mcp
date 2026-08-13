@@ -64,6 +64,34 @@ Restart Claude Desktop. Ask "what's in this database?" — `describe_schema` ret
 
 `docker compose up` starts a disposable Postgres (postgres:16-alpine) with both roles provisioned via `docker/init/01-roles.sql`, and the audit schema created via `docker/init/02-audit-log.sql`. No manual setup required for tests or local dev.
 
+## Demo database
+
+```bash
+docker compose up -d --wait
+npm run seed:demo
+```
+
+Seeds a synthetic e-commerce dataset (`customers`, `products`, `orders`, `order_items`, ~208k rows total) into an empty database, so there's realistic data to point `describe_schema` / `query` / the write tools at without a real production dataset lying around. The schema (`docker/init/03-demo-schema.sql`) is applied automatically for the disposable Docker Postgres; `npm run seed:demo` applies it itself for a plain local Postgres, so no manual migration step is required either way. Generation is deterministic — a seeded PRNG (mulberry32, not `Math.random()`), so the same `--seed` always produces the exact same rows:
+
+```bash
+npm run seed:demo -- --seed=7
+npm run seed:demo -- --connection="postgres://user:pass@host:5432/db"
+```
+
+Connection resolution follows the same precedence as everywhere else in this project: `--connection` flag > `DATABASE_URL_WRITER` > `POSTGRES_WRITER_URL` > `DATABASE_URL` > the docker-compose writer default. Each run truncates and regenerates the four demo tables, so it's safe to re-run against a non-empty database.
+
+Row-count shape (default seed):
+
+| group | rows | notes |
+| --- | --- | --- |
+| `customers` | 50,000 | |
+| `products` | 2,000 | |
+| `orders` | 60,000 | |
+| `order_items` | ~96,000 | 1-4 items/order |
+| inactive customers (`last_login < 2025-01-01`) | 40,000 | ~80% of customers |
+| test tenant (`customers.segment = 'test_tenant'`) | 8 customers / 320 orders | a small, narrowly-queryable tenant entirely inside the inactive population |
+| `orders.status = 'cancelled'` | 13,200 | exceeds a 10,000-row hard cap, for exercising a hard-cap refusal |
+
 ## Tests
 
 ```bash
@@ -71,7 +99,7 @@ docker compose up -d --wait
 npm test
 ```
 
-Integration tests verify against a live Postgres: role separation, readonly cannot write, `describe_schema` fields, and allowlist filtering.
+Integration tests verify against a live Postgres: role separation, readonly cannot write, `describe_schema` fields, allowlist filtering, and the demo-database seeder's row-count shape (`tests/seedDemo.test.ts` actually runs `npm run seed:demo` and queries the results back).
 
 ## Tools
 

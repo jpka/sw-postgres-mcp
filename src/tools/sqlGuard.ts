@@ -42,6 +42,8 @@ function scanStatement(sql: string): ScanResult {
       const eString = i >= 1 && /^[Ee]$/.test(sql[i - 1]);
       const uString = i >= 2 && sql[i - 1] === "&" && /^[Uu]$/.test(sql[i - 2]);
       const escapeCapable = eString || uString;
+      const uescapeClause = /UESCAPE\s*$/i.test(sql.slice(0, i));
+      const start = i;
       i++;
       while (i < n) {
         if (escapeCapable && sql[i] === "\\") {
@@ -59,7 +61,7 @@ function scanStatement(sql: string): ScanResult {
         i++;
       }
       lastRealEnd = i;
-      out += " ";
+      out += uescapeClause ? sql.slice(start, i) : " ";
       continue;
     }
 
@@ -125,7 +127,9 @@ export function stripTrailingTerminators(sql: string): string {
 
 /** Throw MULTI_STATEMENT / EMPTY_STATEMENT unless `clean` is exactly one statement. */
 export function assertSingleStatement(clean: string): void {
-  const masked = clean.replace(/"(?:[^"]|"")*"/g, (m) => " ".repeat(m.length));
+  const masked = clean
+    .replace(/"(?:[^"]|"")*"/g, (m) => " ".repeat(m.length))
+    .replace(/'(?:[^']|'')*'/g, (m) => " ".repeat(m.length));
   const stripped = masked.trim().replace(/;+\s*$/, "");
   if (stripped.length === 0) {
     throw new ToolFailure(
@@ -246,40 +250,69 @@ function readRelationPart(
   return readWord(sql, start);
 }
 
-/** Decode a `U&"..."` identifier (default `\` escape char) and quote the result. */
+/**
+ * Decode a `U&"..."` identifier and quote the result. The escape character
+ * defaults to `\` but a trailing `UESCAPE '<char>'` clause overrides it, so a
+ * name like `U&"t3q_secret!005ftokens" UESCAPE '!'` is resolved as the same
+ * table as `U&"t3q_secret\005ftokens"` — otherwise a custom escape char would
+ * make the allowlist resolver check a different name and skip the table.
+ */
 function readUnicodeIdentifier(
   sql: string,
   start: number,
 ): { ref: string; end: number } | null {
   let i = start + 3;
-  let name = "";
+  let content = "";
   while (i < sql.length) {
-    const ch = sql[i];
-    if (ch === "\\") {
-      const plus = sql[i + 1] === "+";
-      const digits = plus ? 6 : 4;
-      const hex = sql.slice(i + (plus ? 2 : 1), i + (plus ? 2 : 1) + digits);
-      if (/^(?:[0-9A-Fa-f]{4}|[0-9A-Fa-f]{6})$/.test(hex)) {
-        name += String.fromCodePoint(parseInt(hex, 16));
-        i += (plus ? 2 : 1) + digits;
-        continue;
-      }
-      name += ch;
-      i++;
-      continue;
-    }
-    if (ch === '"') {
+    if (sql[i] === '"') {
       if (sql[i + 1] === '"') {
-        name += '"';
+        content += '""';
         i += 2;
         continue;
       }
-      return { ref: `"${name.replace(/"/g, '""')}"`, end: i + 1 };
+      break;
     }
-    name += ch;
+    content += sql[i];
     i++;
   }
-  return null;
+  if (i >= sql.length) return null;
+
+  let end = i + 1;
+  let escapeChar = "\\";
+  const ues = /^\s*UESCAPE\s+'([^']*)'/i.exec(sql.slice(end));
+  if (ues && ues[1].length > 0) {
+    escapeChar = ues[1];
+    end += ues[0].length;
+  }
+
+  let name = "";
+  for (let j = 0; j < content.length; j++) {
+    const c = content[j];
+    if (c === '"') {
+      name += c;
+      if (content[j + 1] === '"') j++;
+      continue;
+    }
+    if (c === escapeChar) {
+      const plus = content[j + 1] === "+";
+      const digits = plus ? 6 : 4;
+      const hex = content.slice(j + (plus ? 2 : 1), j + (plus ? 2 : 1) + digits);
+      if (/^(?:[0-9A-Fa-f]{4}|[0-9A-Fa-f]{6})$/.test(hex)) {
+        name += String.fromCodePoint(parseInt(hex, 16));
+        j += (plus ? 2 : 1) + digits - 1;
+        continue;
+      }
+      if (content[j + 1] === escapeChar) {
+        name += escapeChar;
+        j++;
+        continue;
+      }
+      name += c;
+      continue;
+    }
+    name += c;
+  }
+  return { ref: `"${name.replace(/"/g, '""')}"`, end };
 }
 
 /** Index just past the `)` that closes the group opened at `open`, or -1. */

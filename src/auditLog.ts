@@ -2,9 +2,11 @@ import type pg from "pg";
 
 export type AuditStatus =
   | "previewed"
+  | "awaiting_approval"
   | "approved"
   | "executed"
   | "rejected"
+  | "hard_cap_refused"
   | "failed";
 
 export interface AuditEntry {

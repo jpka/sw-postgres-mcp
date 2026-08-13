@@ -204,6 +204,26 @@ describe("audit trail wired into the two-phase write core", () => {
     expect(failedRow.caller_id).toBe(CALLER_ID);
   });
 
+  it("an approval writes an approved row attributed to approve_plan, not the original write tool", async () => {
+    const reason = `approve-attribution-${randomUUID()}`;
+    const preview = await tw.preview(`DELETE FROM ${TABLE} WHERE label = 'a'`, [], {
+      tool: "delete_rows",
+      reason,
+    });
+
+    await tw.approvePlan(preview.planToken, "reviewer@example.com");
+
+    const rows = await auditRowsForReason(reason);
+    expect(rows.map((r) => r.status)).toEqual(["previewed", "approved"]);
+    const approvedRow = rows[1];
+    // The approval event itself must be attributed to approve_plan, not
+    // carried over from meta.tool (the original delete_rows preview) —
+    // otherwise the audit trail misattributes the approval as a delete.
+    expect(approvedRow.tool).toBe("approve_plan");
+    expect(approvedRow.plan_token).toBe(preview.planToken);
+    expect(approvedRow.approved_by).toBe("reviewer@example.com");
+  });
+
   it("a failed preview (invalid statement) still writes a failed row", async () => {
     const reason = `fail-preview-${randomUUID()}`;
     await expect(

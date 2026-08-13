@@ -149,4 +149,24 @@ describe("MCP server tools", () => {
     expect(parsed.code).toBe("QUERY_FAILED");
     expect(parsed.hint).toBeTruthy();
   });
+
+  // Regression test for the self-approval hole CodeRabbit flagged on PR #18:
+  // approve_plan must not be reachable by the same agent that requests a
+  // gated write. TwoPhaseWrite.approvePlan() still exists (src/writeCore.ts)
+  // for ticket #7's future human-approval surface to call directly, but it
+  // must never be exposed through this agent-facing MCP tool surface.
+  it("approve_plan is not exposed on the agent-facing MCP tool surface", async () => {
+    const tools = await client.listTools();
+    expect(tools.tools.map((t) => t.name)).not.toContain("approve_plan");
+
+    const result = await client.callTool({
+      name: "approve_plan",
+      arguments: { plan_token: "does-not-matter" },
+    });
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0].text;
+    const parsed = JSON.parse(text) as { code: string; message: string; hint: string };
+    expect(parsed.code).toBe("UNKNOWN_TOOL");
+    expect(parsed.message).toMatch(/approve_plan/);
+  });
 });

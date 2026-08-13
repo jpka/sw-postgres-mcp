@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.jpka/sw-postgres-mcp",
+  "title": "sw-postgres-mcp",
+  "description": "Safe-write Postgres MCP server with preview-before-execute writes and rollback safety.",
+  "repository": {
+    "url": "https://github.com/jpka/sw-postgres-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "sw-postgres-mcp",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "DATABASE_URL_READONLY",
+          "description": "Postgres connection string for the read-only role.",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "DATABASE_URL_WRITER",
+          "description": "Postgres connection string for the writer role.",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

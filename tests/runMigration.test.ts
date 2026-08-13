@@ -123,6 +123,34 @@ describe("parseDdlStatement — DDL target extraction (#9)", () => {
     });
   });
 
+  it("is not fooled by a quoted index name containing the literal text 'ON <table>' (CWE-863 regression)", () => {
+    // The index name is consumed positionally, not found by searching the
+    // statement text for "ON" — a naive text search would match the "ON"
+    // inside this quoted name and misreport the target as public.customers
+    // instead of the real target, restricted.secrets.
+    expect(
+      parseDdlStatement('CREATE INDEX "i ON public.customers " ON restricted.secrets (col)'),
+    ).toEqual({
+      kind: "CREATE_INDEX",
+      targets: [{ schema: "restricted", table: "secrets" }],
+    });
+  });
+
+  it("rejects a three-part database.schema.table name rather than mis-parsing it as schema.table", () => {
+    // PostgreSQL accepts this pro-forma three-part form only when `database`
+    // matches the currently-connected database — this parser can't know
+    // that, so it must refuse rather than silently read the wrong two parts
+    // (which would drop the real table name entirely).
+    expect(parseDdlStatement("CREATE TABLE mydb.restricted.secrets (id int)")).toEqual({
+      kind: "CREATE_TABLE",
+      targets: [],
+    });
+    expect(parseDdlStatement("ALTER TABLE mydb.restricted.secrets ADD COLUMN x int")).toEqual({
+      kind: "ALTER_TABLE",
+      targets: [],
+    });
+  });
+
   it("does not false-positive on a semicolon or keyword-looking text inside a string literal", () => {
     expect(
       parseDdlStatement(
@@ -393,6 +421,50 @@ describe("run_migration (#9)", () => {
     const { isError, body } = parseToolResult(result as never);
     expect(isError).toBe(true);
     expect(body.code).toBe("TABLE_NOT_WRITABLE");
+    expect(await auditRowsForReason(reason)).toHaveLength(0);
+  });
+
+  it("CWE-863 regression: a quoted index name containing 'ON public.customers' cannot smuggle that false target past the allowlist check for the real (non-allowlisted) target", async () => {
+    const reason = `mig-idx-on-bypass-${randomUUID()}`;
+    // "public" is allowlisted (schema-wide), "restricted" is not. If the
+    // index-name-vs-ON parsing regressed to a text search, this statement's
+    // reported target would be misparsed as public.customers — which IS
+    // allowlisted — and the statement would incorrectly proceed to preview
+    // against the database, even though it actually targets
+    // restricted.secrets. It must instead be refused as TABLE_NOT_WRITABLE
+    // against the real target, before ever reaching the database.
+    const result = await client.callTool({
+      name: "run_migration",
+      arguments: {
+        statement: 'CREATE INDEX "i ON public.customers " ON restricted.secrets (col)',
+        reason,
+      },
+    });
+    const { isError, body } = parseToolResult(result as never);
+    expect(isError).toBe(true);
+    expect(body.code).toBe("TABLE_NOT_WRITABLE");
+    expect(body.message).toContain("restricted.secrets");
+    expect(await auditRowsForReason(reason)).toHaveLength(0);
+  });
+
+  it("CREATE INDEX CONCURRENTLY is refused before the preview transaction begins, rather than failing with a raw Postgres 25001 error", async () => {
+    const table = migTableName();
+    const reason = `mig-concurrently-${randomUUID()}`;
+    await serverPools.writerPool.query(
+      `CREATE TABLE public.${table} (id serial primary key, email text not null)`,
+    );
+
+    const result = await client.callTool({
+      name: "run_migration",
+      arguments: {
+        statement: `CREATE INDEX CONCURRENTLY idx_x ON public.${table} (email)`,
+        reason,
+      },
+    });
+    const { isError, body } = parseToolResult(result as never);
+    expect(isError).toBe(true);
+    expect(body.code).toBe("INVALID_INPUT");
+    // Never reached TwoPhaseWrite.preview() / BEGIN at all — no audit row exists.
     expect(await auditRowsForReason(reason)).toHaveLength(0);
   });
 

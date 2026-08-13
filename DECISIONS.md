@@ -93,7 +93,7 @@ literal, accurate answer for a statement with no `RETURNING` rows to report.
 
 ### The ROWSET_CHANGED digest check: skipped for DDL, for a stronger reason than INSERT's
 
-#8's entry above explains why the digest comparison is skipped for INSERT: there's no
+Ticket #8's entry above explains why the digest comparison is skipped for INSERT: there's no
 pre-existing matched row set to compare against, so the check would false-positive on
 every insert into a table with a server-generated column. DDL shares that same
 underlying reason (no pre-existing matched rows a WHERE clause selected) but more

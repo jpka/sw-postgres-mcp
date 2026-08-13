@@ -16,6 +16,16 @@ const SUPPORTED_FORMS_HINT =
   "alone (see DECISIONS.md) — use ALTER TABLE ... DROP CONSTRAINT or drop and recreate the table's " +
   "indexes via CREATE/DROP TABLE instead, or ask for DROP INDEX support to be added.";
 
+// PostgreSQL categorically refuses to run CREATE INDEX CONCURRENTLY inside a
+// transaction block (SQLSTATE 25001), but preview()/execute() always wrap DDL
+// in BEGIN...ROLLBACK / BEGIN...COMMIT (see writeCore.ts). Left unchecked,
+// this reaches the database and fails with a raw Postgres error instead of a
+// clean refusal — checked here, before write.preview() is ever called (and
+// so before that BEGIN runs), the same place the other unsupported-input
+// cases above are refused.
+const CREATE_INDEX_CONCURRENTLY_RE =
+  /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\b/i;
+
 /**
  * Preview a DDL migration (two-phase, same core as `delete_rows`/`insert_rows`/
  * `update_rows`): runs the statement inside a transaction — Postgres DDL is
@@ -61,6 +71,16 @@ export async function previewRunMigration(
       "INVALID_INPUT",
       "run_migration only accepts CREATE, ALTER, or DROP statements.",
       `Use delete_rows/insert_rows/update_rows for data changes. ${SUPPORTED_FORMS_HINT}`,
+    );
+  }
+
+  if (CREATE_INDEX_CONCURRENTLY_RE.test(clean)) {
+    throw new WriteError(
+      "INVALID_INPUT",
+      "CREATE INDEX CONCURRENTLY cannot run here: PostgreSQL refuses to run it inside a " +
+        "transaction block, and run_migration's preview/execute always wrap DDL in one.",
+      "Drop CONCURRENTLY and use plain CREATE [UNIQUE] INDEX instead, or run this migration " +
+        "directly against the database outside run_migration.",
     );
   }
 

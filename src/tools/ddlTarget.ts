@@ -63,7 +63,19 @@ function readQualifiedRelation(
   if (clean[afterFirst] === ".") {
     const second = readWord(clean, skipWs(clean, afterFirst + 1));
     if (second) {
-      return { schema: first.value, table: second.value, end: skipWs(clean, second.end) };
+      const afterSecond = skipWs(clean, second.end);
+      // PostgreSQL accepts a pro-forma three-part `database.schema.table`
+      // name, valid only when `database` matches the currently-connected
+      // database — this parser has no way to know that, so reading only the
+      // first two parts here would report schema=database, table=schema and
+      // silently drop the real table name, letting the allowlist check run
+      // against an identity Postgres never touches while it operates on the
+      // (unread) real target. Rather than guess, treat any three-part name
+      // as unparseable so the caller refuses the statement outright.
+      if (clean[afterSecond] === "." && readWord(clean, skipWs(clean, afterSecond + 1))) {
+        return null;
+      }
+      return { schema: first.value, table: second.value, end: afterSecond };
     }
   }
   return { schema: null, table: first.value, end: afterFirst };
@@ -91,17 +103,44 @@ function parseDropTableTargets(clean: string, start: number): DdlTarget[] {
   return targets;
 }
 
+/** True when `word` is the bare (unquoted) keyword, case-insensitively. */
+function isUnquotedKeyword(word: { value: string; raw: string }, keyword: string): boolean {
+  return word.raw[0] !== '"' && word.value.toUpperCase() === keyword;
+}
+
 /**
  * `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] [name] ON [ONLY] table`
- * — rather than parsing the optional index name explicitly, this finds the
- * `ON` keyword (word-boundary matched, so it can't fire inside a longer
- * identifier like `idx_on_customers`) and reads the relation right after it.
+ * — the optional index name is consumed positionally (one token, quoted or
+ * unquoted, or absent) rather than by searching the remaining text for the
+ * `ON` keyword. A quoted index name can itself contain the substring `ON`
+ * (e.g. `"i ON public.customers "`), which a text search would find before
+ * the real `ON` and misreport as the target — this previously let a crafted
+ * index name smuggle a false target past the allowlist check while the
+ * statement executed against a different, unchecked table (CWE-863). By
+ * reading one token at a time, a quoted name is consumed whole (via
+ * `readWord`'s quote handling) and never inspected for keyword text, so only
+ * the literal, unquoted `ON` token that follows it can ever match.
  */
 function parseCreateIndexTarget(clean: string, afterPrefix: number): DdlTarget | null {
-  const rest = clean.slice(afterPrefix);
-  const onMatch = /\bON\s+(?:ONLY\s+)?/i.exec(rest);
-  if (!onMatch) return null;
-  const rel = readQualifiedRelation(clean, afterPrefix + onMatch.index + onMatch[0].length);
+  let pos = skipWs(clean, afterPrefix);
+  let word = readWord(clean, pos);
+  if (!word) return null;
+
+  if (!isUnquotedKeyword(word, "ON")) {
+    // Not the ON keyword, so this token was the optional index name (quoted
+    // or unquoted). The very next token must now literally be ON.
+    pos = skipWs(clean, word.end);
+    word = readWord(clean, pos);
+    if (!word || !isUnquotedKeyword(word, "ON")) return null;
+  }
+
+  pos = skipWs(clean, word.end);
+  const only = readWord(clean, pos);
+  if (only && isUnquotedKeyword(only, "ONLY")) {
+    pos = skipWs(clean, only.end);
+  }
+
+  const rel = readQualifiedRelation(clean, pos);
   return rel ? toTarget(rel) : null;
 }
 

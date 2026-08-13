@@ -39,10 +39,22 @@ export interface WritePreview {
   params: readonly unknown[];
   /**
    * "previewed" — the token is usable via execute_plan right away.
-   * "awaiting_approval" — affectedRows exceeded approvalRequiredAboveRows;
-   * the token exists but execute_plan refuses it until approvePlan is called.
+   * "awaiting_approval" — either affectedRows exceeded
+   * approvalRequiredAboveRows, or the caller forced approval via
+   * `WriteMeta.alwaysRequireApproval` (run_migration, ticket #9) regardless
+   * of row count; the token exists but execute_plan refuses it until
+   * approvePlan is called.
    */
   status: "previewed" | "awaiting_approval";
+  /**
+   * Schema-qualified target this statement acts on (e.g. "public.customers"),
+   * when known ahead of preview — set by run_migration (ticket #9) so a
+   * human approval surface has something to judge a DDL statement by beyond
+   * affectedRows/sampleRows, which for DDL are always 0/[] (see
+   * `isDdlStatement` below). null for every other tool: their affected rows
+   * and sample rows already identify what the statement touches.
+   */
+  target: string | null;
 }
 
 export interface ExecuteResult {
@@ -66,6 +78,8 @@ export interface PendingPlan {
   sampleRows: unknown[];
   expiresAt: number;
   callerId: string;
+  /** See WritePreview.target. null for every tool except run_migration. */
+  target: string | null;
 }
 
 export interface TwoPhaseWriteOptions {
@@ -98,6 +112,21 @@ const DEFAULT_HARD_MAX_ROWS = 10_000;
 export interface WriteMeta {
   tool: string;
   reason?: string | null;
+  /**
+   * Forces `status: "awaiting_approval"` regardless of affectedRows vs
+   * `approvalRequiredAboveRows` — the mechanism ticket #9 (`run_migration`)
+   * needs so DDL always requires human approval, since a migration
+   * affecting zero rows can still be destructive and row count is
+   * deliberately not the gate for it. Must only ever be set to `true` by a
+   * tool module's own code (e.g. `src/tools/runMigration.ts` hardcodes it on
+   * every call) — it is never read from `input`/agent-supplied arguments, so
+   * there is no field in `run_migration`'s MCP tool schema that reaches this
+   * and no way for the calling agent to set or unset it. See DECISIONS.md.
+   * Default false/undefined.
+   */
+  alwaysRequireApproval?: boolean;
+  /** See WritePreview.target. Default null. */
+  target?: string | null;
 }
 
 const DEFAULT_WRITE_META: WriteMeta = { tool: "unknown_tool" };
@@ -107,6 +136,7 @@ interface TokenMeta {
   reason: string | null;
   callerId: string;
   previewRows: number;
+  target: string | null;
 }
 
 interface TokenEntry extends TokenMeta {
@@ -226,6 +256,7 @@ class TokenStore {
         sampleRows: entry.sampleRows,
         expiresAt: entry.expiresAt,
         callerId: entry.callerId,
+        target: entry.target,
       });
     }
     // Soonest-expiring first — the plans a human needs to act on most urgently lead the list.
@@ -247,6 +278,7 @@ class TokenStore {
           reason: entry.reason,
           callerId: entry.callerId,
           previewRows: entry.previewRows,
+          target: entry.target,
         }
       : undefined;
 
@@ -315,6 +347,7 @@ class TokenStore {
           reason: entry.reason,
           callerId: entry.callerId,
           previewRows: entry.previewRows,
+          target: entry.target,
         }
       : undefined;
 
@@ -371,6 +404,7 @@ class TokenStore {
           reason: entry.reason,
           callerId: entry.callerId,
           previewRows: entry.previewRows,
+          target: entry.target,
         }
       : undefined;
 
@@ -504,24 +538,42 @@ export class TwoPhaseWrite {
   ): Promise<WritePreview> {
     const startedAt = Date.now();
     const reason = meta.reason ?? null;
+    const target = meta.target ?? null;
     const client = await this.opts.pool.connect();
     try {
       await client.query(`SET statement_timeout = ${this.opts.statementTimeoutMs}`);
       await client.query("BEGIN");
-      const res = await client.query(this.previewSql(statement), params as unknown[]);
-      await client.query("ROLLBACK");
 
-      const row = res.rows[0] as {
-        affected_rows: number;
-        sample_rows: unknown;
-        rows_digest: string;
-      };
-      // The exact count from the rolled-back preview — never an EXPLAIN
-      // estimate. Both thresholds below compare against this number.
-      const affectedRows = Number(row.affected_rows);
-      const sampleRows = Array.isArray(row.sample_rows)
-        ? row.sample_rows
-        : [];
+      let affectedRows: number;
+      let sampleRows: unknown[];
+      let rowsDigest: string;
+      if (isDdlStatement(statement)) {
+        // DDL has no RETURNING clause to wrap, so there is no "affected
+        // rows"/"sample rows" concept to capture the way DELETE/UPDATE/INSERT
+        // have — 0/[] here is not a stand-in row count, it is the accurate
+        // answer for a statement with no rows to return (see DECISIONS.md).
+        // The statement still runs inside this same BEGIN/ROLLBACK, so a
+        // CREATE TABLE/ALTER TABLE preview is a real, rolled-back DDL
+        // execution — Postgres DDL is transactional, so this rolls back
+        // cleanly like any other preview.
+        await client.query(statement, params as unknown[]);
+        affectedRows = 0;
+        sampleRows = [];
+        rowsDigest = "";
+      } else {
+        const res = await client.query(this.previewSql(statement), params as unknown[]);
+        const row = res.rows[0] as {
+          affected_rows: number;
+          sample_rows: unknown;
+          rows_digest: string;
+        };
+        // The exact count from the rolled-back preview — never an EXPLAIN
+        // estimate. Both thresholds below compare against this number.
+        affectedRows = Number(row.affected_rows);
+        sampleRows = Array.isArray(row.sample_rows) ? row.sample_rows : [];
+        rowsDigest = row.rows_digest;
+      }
+      await client.query("ROLLBACK");
 
       if (affectedRows > this.hardMaxRows) {
         // A wall, not a gate: no token is issued, there is nothing to
@@ -550,15 +602,21 @@ export class TwoPhaseWrite {
         );
       }
 
-      const requiresApproval = affectedRows > this.approvalRequiredAboveRows;
+      // `alwaysRequireApproval` (run_migration, ticket #9) forces this true
+      // unconditionally — the approvalRequiredAboveRows/hardMaxRows
+      // thresholds above are never consulted for it, on purpose: a DDL
+      // statement affecting zero rows can still be the most destructive
+      // thing this server does, so row count is deliberately not the gate.
+      const requiresApproval =
+        meta.alwaysRequireApproval === true || affectedRows > this.approvalRequiredAboveRows;
       const status: WritePreview["status"] = requiresApproval
         ? "awaiting_approval"
         : "previewed";
 
       const planToken = this.store.create(
         statementFingerprint(statement, params),
-        row.rows_digest,
-        { tool: meta.tool, reason, callerId: this.callerId, previewRows: affectedRows },
+        rowsDigest,
+        { tool: meta.tool, reason, callerId: this.callerId, previewRows: affectedRows, target },
         requiresApproval,
         { statement, params, sampleRows },
       );
@@ -583,7 +641,7 @@ export class TwoPhaseWrite {
         client,
       );
 
-      return { planToken, affectedRows, sampleRows, statement, params, status };
+      return { planToken, affectedRows, sampleRows, statement, params, status, target };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       // HARD_MAX_ROWS_EXCEEDED is thrown deliberately above, after already
@@ -628,7 +686,8 @@ export class TwoPhaseWrite {
     // meta to recover — fall back to generic attribution so the attempt is
     // still audited rather than dropped.
     const meta: TokenMeta =
-      consumed.meta ?? { tool: "execute_plan", reason: null, callerId: this.callerId, previewRows: NaN };
+      consumed.meta ??
+      { tool: "execute_plan", reason: null, callerId: this.callerId, previewRows: NaN, target: null };
     const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
 
     if (!consumed.ok) {
@@ -652,34 +711,51 @@ export class TwoPhaseWrite {
     try {
       await client.query(`SET statement_timeout = ${this.opts.statementTimeoutMs}`);
       await client.query("BEGIN");
-      const res = await client.query(this.executeSql(statement), params as unknown[]);
-      const row = res.rows[0] as {
-        affected_rows: number;
-        rows_digest: string;
-      };
-      // The digest check only makes sense for statements that *match*
-      // pre-existing rows (DELETE/UPDATE's WHERE) — it exists to catch "the
-      // matched row set changed under me between preview and execute". An
-      // INSERT has no pre-existing rows to match: its RETURNING content is
-      // freshly generated every time (most visibly, any serial/identity
-      // column's nextval()), so the preview's rolled-back INSERT and the
-      // execute's real one deterministically produce *different* generated
-      // values even though nothing "changed" in any sense this check cares
-      // about. Comparing digests for INSERT would make ROWSET_CHANGED fire
-      // on effectively every insert into a table with a server-generated
-      // default, which is not the concurrent-modification signal this check
-      // exists to catch — statementFingerprint (exact statement + params)
-      // already guarantees execute() replays the identical INSERT the agent
-      // previewed, which is the only guarantee that applies here.
-      if (!isInsertStatement(statement) && row.rows_digest !== consumed.rowsDigest) {
-        throw new WriteError(
-          "ROWSET_CHANGED",
-          "The set of rows the statement would affect changed since the preview.",
-          "Another write or transaction modified matching rows. Re-run delete_rows to obtain a fresh preview and token.",
-        );
+
+      let affectedRows: number;
+      if (isDdlStatement(statement)) {
+        // No RETURNING clause exists for DDL, so — mirroring the same branch
+        // in preview() — this runs the raw statement and skips the digest
+        // comparison entirely rather than trying to force it through
+        // executeSql's RETURNING wrapper (which DDL doesn't support). The
+        // ROWSET_CHANGED check exists to catch "the matched row set changed
+        // between preview and execute" for DELETE/UPDATE's WHERE-matched
+        // rows; DDL has no such matched row set for the same reason INSERT
+        // doesn't (see the comment below) — statementFingerprint (exact
+        // statement + params) plus the token's single-use/expiry/approval
+        // guarantees are what apply here instead. See DECISIONS.md.
+        await client.query(statement, params as unknown[]);
+        affectedRows = 0;
+      } else {
+        const res = await client.query(this.executeSql(statement), params as unknown[]);
+        const row = res.rows[0] as {
+          affected_rows: number;
+          rows_digest: string;
+        };
+        // The digest check only makes sense for statements that *match*
+        // pre-existing rows (DELETE/UPDATE's WHERE) — it exists to catch "the
+        // matched row set changed under me between preview and execute". An
+        // INSERT has no pre-existing rows to match: its RETURNING content is
+        // freshly generated every time (most visibly, any serial/identity
+        // column's nextval()), so the preview's rolled-back INSERT and the
+        // execute's real one deterministically produce *different* generated
+        // values even though nothing "changed" in any sense this check cares
+        // about. Comparing digests for INSERT would make ROWSET_CHANGED fire
+        // on effectively every insert into a table with a server-generated
+        // default, which is not the concurrent-modification signal this check
+        // exists to catch — statementFingerprint (exact statement + params)
+        // already guarantees execute() replays the identical INSERT the agent
+        // previewed, which is the only guarantee that applies here.
+        if (!isInsertStatement(statement) && row.rows_digest !== consumed.rowsDigest) {
+          throw new WriteError(
+            "ROWSET_CHANGED",
+            "The set of rows the statement would affect changed since the preview.",
+            "Another write or transaction modified matching rows. Re-run delete_rows to obtain a fresh preview and token.",
+          );
+        }
+        affectedRows = Number(row.affected_rows);
       }
       await client.query("COMMIT");
-      const affectedRows = Number(row.affected_rows);
 
       // Recorded after COMMIT, on the same connection (now back to
       // autocommit), so a failure to write the audit row can never roll back
@@ -747,7 +823,8 @@ export class TwoPhaseWrite {
     const startedAt = Date.now();
     const result = this.store.approve(planToken);
     const meta: TokenMeta =
-      result.meta ?? { tool: "approve_plan", reason: null, callerId: this.callerId, previewRows: NaN };
+      result.meta ??
+      { tool: "approve_plan", reason: null, callerId: this.callerId, previewRows: NaN, target: null };
     const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
 
     if (!result.ok) {
@@ -812,7 +889,8 @@ export class TwoPhaseWrite {
     const startedAt = Date.now();
     const result = this.store.reject(planToken, reason);
     const meta: TokenMeta =
-      result.meta ?? { tool: "reject_plan", reason: null, callerId: this.callerId, previewRows: NaN };
+      result.meta ??
+      { tool: "reject_plan", reason: null, callerId: this.callerId, previewRows: NaN, target: null };
     const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
 
     if (!result.ok) {
@@ -908,6 +986,23 @@ function rowsDigestExpr(): string {
  */
 function isInsertStatement(statement: string): boolean {
   return /^\s*insert\b/i.test(statement);
+}
+
+/**
+ * True for the DDL forms `run_migration` (ticket #9) issues — CREATE, ALTER,
+ * and DROP statements. Same reasoning as `isInsertStatement` above: this
+ * project's own tool code is the only thing that ever builds the statement
+ * text preview()/execute() see (see src/tools/runMigration.ts, which also
+ * validates the leading keyword itself before ever calling preview()), so a
+ * leading-keyword check is sufficient — this never needs to handle CTEs,
+ * comments, or other disguised forms. Drives two things here: which SQL
+ * preview()/execute() run (DDL has no RETURNING clause to wrap) and that the
+ * ROWSET_CHANGED digest comparison is skipped (DDL has no pre-existing
+ * matched row set for the same reason INSERT doesn't — see execute()'s
+ * comment and DECISIONS.md).
+ */
+function isDdlStatement(statement: string): boolean {
+  return /^\s*(create|alter|drop)\b/i.test(statement);
 }
 
 function translateDbError(err: unknown): unknown {

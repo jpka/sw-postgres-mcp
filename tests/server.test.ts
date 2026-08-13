@@ -4,6 +4,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { createServer } from "../src/server.js";
 import type { AppConfig } from "../src/config.js";
+import { DEFAULT_WRITE_CONFIG } from "../src/config.js";
 import { createPools } from "../src/db.js";
 import { READONLY_URL, WRITER_URL, SUPERUSER_URL, waitForDb, withSuperuser } from "./helpers.js";
 
@@ -44,6 +45,7 @@ describe("MCP server describe_schema", () => {
         read: { schemas: ["public"] },
         write: { schemas: [], tables: [] },
       },
+      write: DEFAULT_WRITE_CONFIG,
     };
 
     serverPools = createPools(config);

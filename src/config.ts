@@ -18,9 +18,22 @@ export interface AllowlistConfig {
   write: AllowlistSection;
 }
 
+export interface WriteConfig {
+  /** How long a plan token stays valid, in milliseconds. Default 60_000. */
+  planTtlMs: number;
+  /** Per-connection statement_timeout for write executions, in milliseconds. Default 10_000. */
+  statementTimeoutMs: number;
+}
+
+export const DEFAULT_WRITE_CONFIG: WriteConfig = {
+  planTtlMs: 60_000,
+  statementTimeoutMs: 10_000,
+};
+
 export interface AppConfig {
   database: DatabaseConfig;
   allowlist: AllowlistConfig;
+  write: WriteConfig;
 }
 
 function parseAllowlistSection(raw: unknown): AllowlistSection {
@@ -95,6 +108,23 @@ export function loadConfig(configPath?: string): AppConfig {
   const r = (raw ?? {}) as Record<string, unknown>;
   const dbRaw = (r.database ?? {}) as Record<string, unknown>;
   const allowRaw = (r.allowlist ?? {}) as Record<string, unknown>;
+  const writeRaw = (r.write ?? {}) as Record<string, unknown>;
+
+  const numberOr = (v: unknown, fallback: number): number =>
+    typeof v === "number" && Number.isFinite(v) ? v : fallback;
+
+  const write: WriteConfig = {
+    planTtlMs:
+      numberOr(
+        parseIntSafe(process.env.SW_PLAN_TTL_MS),
+        numberOr(writeRaw.planTtlMs, DEFAULT_WRITE_CONFIG.planTtlMs),
+      ),
+    statementTimeoutMs:
+      numberOr(
+        parseIntSafe(process.env.SW_STATEMENT_TIMEOUT_MS),
+        numberOr(writeRaw.statementTimeoutMs, DEFAULT_WRITE_CONFIG.statementTimeoutMs),
+      ),
+  };
 
   // Allowlist supports both nested {read, write} and legacy flat keys for backwards compat
   let allowlist: AllowlistConfig;
@@ -158,5 +188,11 @@ export function loadConfig(configPath?: string): AppConfig {
     );
   }
 
-  return { database, allowlist };
+  return { database, allowlist, write };
+}
+
+function parseIntSafe(value: string | undefined): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) ? n : undefined;
 }

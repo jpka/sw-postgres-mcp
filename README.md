@@ -32,6 +32,8 @@ Copy `config.example.json` to `config.json` (or set `SW_POSTGRES_CONFIG` to a cu
 
 - `allowlist.read` — schemas/tables the agent may see via `describe_schema`/`query`. If empty, all tables are readable. If `tables` is non-empty, only those fully-qualified tables are listed.
 - `allowlist.write` — schemas/tables the agent may mutate. **Defaults to deny**: if both `schemas` and `tables` are empty, nothing is writable. Add entries explicitly.
+- `write.planTtlMs` — how long a `plan_token` stays valid (default `60000`). Overridable with `SW_PLAN_TTL_MS`.
+- `write.statementTimeoutMs` — per-connection `statement_timeout` for write executions (default `10000`). Overridable with `SW_STATEMENT_TIMEOUT_MS`.
 - Environment variables `DATABASE_URL_READONLY` / `DATABASE_URL_WRITER` override the file.
 
 Two connection pools are created with distinct Postgres roles (`readonly` vs `writer`). Read-only is enforced by the database grants, not by parsing SQL — a bug in our code cannot turn a read tool into a write tool.
@@ -73,5 +75,14 @@ Integration tests verify against a live Postgres: role separation, readonly cann
 ## Tools
 
 - `describe_schema` — tables, columns with types, foreign keys, row-count estimates (respects read allowlist).
+- `delete_rows` — **two-phase delete**. Runs the statement inside a transaction, returns the exact affected row count plus a sample of affected rows, then rolls back. The response includes a `plan_token`, the exact `statement`, and `params`.
+- `execute_plan` — commits a previously previewed write. Pass back the `plan_token`, `statement`, and `params` from the preview response.
 
-More tools (`query`, `explain_plan`, `insert_rows`, `update_rows`, `delete_rows`, `run_migration`, `execute_plan`) arrive in later slices.
+### Two-phase writes
+
+The agent must commit to a preview before it can execute:
+
+1. `delete_rows` runs the statement in a transaction, captures the exact affected row count and a sample of affected rows via `RETURNING`, then **rolls back**. Nothing has changed in the database.
+2. `execute_plan` replays the identical statement and commits — but only if the token is valid, unexpired, unused, and bound to the exact statement + params from the preview.
+
+A `DELETE` without a `WHERE` clause is refused unless `confirm_full_table: true` is passed. Every write runs through the `writer` pool; the `readonly` pool is never used for a mutation.

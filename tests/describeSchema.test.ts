@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import pg from "pg";
 import { describeSchema } from "../src/tools/describeSchema.js";
 import type { AppConfig } from "../src/config.js";
+import { DEFAULT_WRITE_CONFIG } from "../src/config.js";
 import {
   READONLY_URL,
   SUPERUSER_URL,
@@ -26,6 +27,7 @@ function makeConfig(overrides: Partial<AppConfig["allowlist"]> = {}): AppConfig 
       },
       ...overrides,
     } as AppConfig["allowlist"],
+    write: DEFAULT_WRITE_CONFIG,
   };
 }
 
@@ -122,6 +124,7 @@ describe("describe_schema", () => {
         },
         write: { schemas: [], tables: [] },
       },
+      write: DEFAULT_WRITE_CONFIG,
     };
     const tables = await describeSchema(roPool, config);
     const names = tables.map((t) => `${t.schema}.${t.table}`);
@@ -130,7 +133,6 @@ describe("describe_schema", () => {
     expect(names).not.toContain("public.secret_tokens");
     expect(names).not.toContain("public.order_items");
   });
-
   it("FKs referencing non-allowlisted tables are dropped from output", async () => {
     const config: AppConfig = {
       database: {
@@ -143,6 +145,7 @@ describe("describe_schema", () => {
         },
         write: { schemas: [], tables: [] },
       },
+      write: DEFAULT_WRITE_CONFIG,
     };
     const tables = await describeSchema(roPool, config);
     const names = tables.map((t) => `${t.schema}.${t.table}`);
@@ -163,6 +166,7 @@ describe("describe_schema", () => {
         },
         write: { schemas: [], tables: [] },
       },
+      write: DEFAULT_WRITE_CONFIG,
     };
     const tables2 = await describeSchema(roPool, config2);
     const orders = tables2.find((t) => t.table === "orders");

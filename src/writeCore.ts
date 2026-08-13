@@ -12,6 +12,7 @@ export type WriteErrorCode =
   | "NO_WHERE_CLAUSE"
   | "TABLE_NOT_WRITABLE"
   | "INVALID_TABLE_NAME"
+  | "INVALID_INPUT"
   | "AWAITING_APPROVAL"
   | "HARD_MAX_ROWS_EXCEEDED"
   | "PLAN_REJECTED";
@@ -656,7 +657,21 @@ export class TwoPhaseWrite {
         affected_rows: number;
         rows_digest: string;
       };
-      if (row.rows_digest !== consumed.rowsDigest) {
+      // The digest check only makes sense for statements that *match*
+      // pre-existing rows (DELETE/UPDATE's WHERE) — it exists to catch "the
+      // matched row set changed under me between preview and execute". An
+      // INSERT has no pre-existing rows to match: its RETURNING content is
+      // freshly generated every time (most visibly, any serial/identity
+      // column's nextval()), so the preview's rolled-back INSERT and the
+      // execute's real one deterministically produce *different* generated
+      // values even though nothing "changed" in any sense this check cares
+      // about. Comparing digests for INSERT would make ROWSET_CHANGED fire
+      // on effectively every insert into a table with a server-generated
+      // default, which is not the concurrent-modification signal this check
+      // exists to catch — statementFingerprint (exact statement + params)
+      // already guarantees execute() replays the identical INSERT the agent
+      // previewed, which is the only guarantee that applies here.
+      if (!isInsertStatement(statement) && row.rows_digest !== consumed.rowsDigest) {
         throw new WriteError(
           "ROWSET_CHANGED",
           "The set of rows the statement would affect changed since the preview.",
@@ -883,6 +898,16 @@ function rowsDigestExpr(): string {
      FROM _affected AS _s),
     ''
   ) AS rows_digest`;
+}
+
+/**
+ * Statements are always constructed by this project's own tool code (see
+ * src/tools/*.ts) — never passed through from arbitrary agent-supplied SQL —
+ * so a simple leading-keyword check is sufficient here; this never needs to
+ * handle CTEs, comments, or other disguised forms of INSERT.
+ */
+function isInsertStatement(statement: string): boolean {
+  return /^\s*insert\b/i.test(statement);
 }
 
 function translateDbError(err: unknown): unknown {

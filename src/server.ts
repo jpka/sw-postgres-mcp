@@ -11,8 +11,10 @@ import { describeSchema } from "./tools/describeSchema.js";
 import { runQuery } from "./tools/query.js";
 import { explainPlan } from "./tools/explainPlan.js";
 import { previewDeleteRows } from "./tools/deleteRows.js";
+import { previewInsertRows } from "./tools/insertRows.js";
+import { previewUpdateRows } from "./tools/updateRows.js";
 import { ToolFailure } from "./tools/errors.js";
-import { TwoPhaseWrite, WriteError } from "./writeCore.js";
+import { TwoPhaseWrite, WriteError, type WritePreview } from "./writeCore.js";
 
 const paramValue = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 
@@ -43,6 +45,26 @@ const deleteRowsSchema = z.object({
   reason: z.string().min(1),
 });
 
+const insertRowsSchema = z.object({
+  table: z.string(),
+  columns: z.array(z.string()).min(1),
+  rows: z.array(z.array(z.unknown())).min(1),
+  // Required to match the tool's declared inputSchema below and so every
+  // audit row for a write carries a real reason (see mcp_audit.log).
+  reason: z.string().min(1),
+});
+
+const updateRowsSchema = z.object({
+  table: z.string(),
+  set: z.record(z.string(), z.unknown()),
+  where: z.string().optional(),
+  params: z.array(z.unknown()).optional(),
+  confirm_full_table: z.boolean().optional(),
+  // Required to match the tool's declared inputSchema below and so every
+  // audit row for a write carries a real reason (see mcp_audit.log).
+  reason: z.string().min(1),
+});
+
 const executePlanSchema = z.object({
   plan_token: z.string(),
   statement: z.string(),
@@ -51,6 +73,37 @@ const executePlanSchema = z.object({
 
 function text(content: string) {
   return { content: [{ type: "text", text: content }] as const };
+}
+
+/**
+ * Shared response shape for every two-phase preview tool (`delete_rows`,
+ * `insert_rows`, `update_rows`) — same fields, same `awaiting_approval`
+ * message, so the three tools stay indistinguishable to the agent beyond
+ * their input shape and the statement they produce.
+ */
+function previewResponse(
+  preview: WritePreview,
+  approvalRequiredAboveRows: number,
+) {
+  const message =
+    preview.status === "awaiting_approval"
+      ? `This plan affects ${preview.affectedRows} rows, above the approval threshold of ${approvalRequiredAboveRows}. It requires human approval through an out-of-band approval surface before execute_plan will succeed — wait for approval, or narrow the statement and re-preview.`
+      : null;
+  return text(
+    JSON.stringify(
+      {
+        status: preview.status,
+        plan_token: preview.planToken,
+        statement: preview.statement,
+        params: preview.params,
+        affected_rows: preview.affectedRows,
+        sample_rows: preview.sampleRows,
+        message,
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 function errorBody(err: unknown) {
@@ -219,9 +272,77 @@ export function createServer(
         },
       },
       {
+        name: "insert_rows",
+        description:
+          "Preview an INSERT (two-phase). Runs the statement inside a transaction, returns the exact row count and a sample of inserted rows via RETURNING, then rolls back. Nothing is changed until execute_plan is called with the returned plan_token. Note: a rolled-back preview still advances any serial/identity sequence the table's columns default from — Postgres sequences are not transactional, so previewing an insert leaves a permanent gap in that column's values even though no row was actually written.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            table: {
+              type: "string",
+              description: "Table to insert into, e.g. \"customers\" or \"public.customers\".",
+            },
+            columns: {
+              type: "array",
+              items: { type: "string" },
+              description: "Column names to insert into, e.g. [\"email\", \"active\"].",
+            },
+            rows: {
+              type: "array",
+              items: { type: "array", items: {} },
+              description: "One array of values per row, positional against `columns` and in the same order, e.g. [[\"a@example.com\", true]].",
+            },
+            reason: {
+              type: "string",
+              description: "Why the agent is performing this write. Recorded for audit.",
+            },
+          },
+          required: ["table", "columns", "rows", "reason"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "update_rows",
+        description:
+          "Preview an UPDATE (two-phase). Runs the statement inside a transaction, returns the exact affected row count and a sample of affected rows (post-update) via RETURNING, then rolls back. Nothing is changed until execute_plan is called with the returned plan_token. Requires a WHERE clause unless confirm_full_table is true (the same guard delete_rows uses).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            table: {
+              type: "string",
+              description: "Table to update, e.g. \"customers\" or \"public.customers\".",
+            },
+            set: {
+              type: "object",
+              additionalProperties: {},
+              description: "Column -> new value to SET, e.g. { \"active\": false }.",
+            },
+            where: {
+              type: "string",
+              description: "SQL conditions for the WHERE clause (without the word WHERE).",
+            },
+            params: {
+              type: "array",
+              items: {},
+              description: "Parameter values referenced by $1, $2, ... in where.",
+            },
+            confirm_full_table: {
+              type: "boolean",
+              description: "Allow UPDATE with no WHERE clause (updates the whole table).",
+            },
+            reason: {
+              type: "string",
+              description: "Why the agent is performing this write. Recorded for audit.",
+            },
+          },
+          required: ["table", "set", "reason"],
+          additionalProperties: false,
+        },
+      },
+      {
         name: "execute_plan",
         description:
-          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the delete_rows preview. The token is single-use, expires, refuses any statement that does not match the preview, refuses to commit if the affected row set changed since the preview, and — if the preview's affected-row count was above write.approvalRequiredAboveRows — refuses until a human approves it through an out-of-band approval surface (not available through this MCP tool set).",
+          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the preview (delete_rows, insert_rows, or update_rows). The token is single-use, expires, and refuses any statement that does not match the preview. For delete_rows and update_rows, it also refuses to commit if the affected row set changed since the preview; insert_rows has no matching row set to compare (a rolled-back preview insert still consumes sequence values), so it relies on the token's fingerprint, single-use, and expiry guarantees instead. If the preview's affected-row count was above write.approvalRequiredAboveRows, execution refuses until a human approves it through an out-of-band approval surface (not available through this MCP tool set).",
         inputSchema: {
           type: "object",
           properties: {
@@ -295,25 +416,29 @@ export function createServer(
       if (!parsed.success) return invalidArguments(parsed.error);
       try {
         const preview = await previewDeleteRows(write, config, parsed.data);
-        const message =
-          preview.status === "awaiting_approval"
-            ? `This plan affects ${preview.affectedRows} rows, above the approval threshold of ${config.write.approvalRequiredAboveRows}. It requires human approval through an out-of-band approval surface before execute_plan will succeed — wait for approval, or narrow the statement and re-preview.`
-            : null;
-        return text(
-          JSON.stringify(
-            {
-              status: preview.status,
-              plan_token: preview.planToken,
-              statement: preview.statement,
-              params: preview.params,
-              affected_rows: preview.affectedRows,
-              sample_rows: preview.sampleRows,
-              message,
-            },
-            null,
-            2,
-          ),
-        );
+        return previewResponse(preview, config.write.approvalRequiredAboveRows);
+      } catch (err) {
+        return errorBody(err);
+      }
+    }
+
+    if (name === "insert_rows") {
+      const parsed = insertRowsSchema.safeParse(args);
+      if (!parsed.success) return invalidArguments(parsed.error);
+      try {
+        const preview = await previewInsertRows(write, config, parsed.data);
+        return previewResponse(preview, config.write.approvalRequiredAboveRows);
+      } catch (err) {
+        return errorBody(err);
+      }
+    }
+
+    if (name === "update_rows") {
+      const parsed = updateRowsSchema.safeParse(args);
+      if (!parsed.success) return invalidArguments(parsed.error);
+      try {
+        const preview = await previewUpdateRows(write, config, parsed.data);
+        return previewResponse(preview, config.write.approvalRequiredAboveRows);
       } catch (err) {
         return errorBody(err);
       }

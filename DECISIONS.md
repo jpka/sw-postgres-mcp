@@ -5,6 +5,87 @@ were, what we picked, and the reasoning a reviewer can check. Newest first.
 
 ---
 
+## 2026-08-13 — insert_rows/update_rows (#8): shared guard, and why the rows-changed digest must skip INSERT
+
+**Ticket:** #8 — extend the two-phase core (`src/writeCore.ts`, built for #4/#6/#5/#7)
+to `insert_rows` and `update_rows`, the same way `delete_rows` already uses it.
+
+### No-WHERE guard: generalized into `src/tools/writeStatements.ts`, not duplicated
+
+`delete_rows`'s "refuse an empty WHERE unless `confirm_full_table: true`" check
+previously lived as inline logic inside `src/tools/deleteRows.ts`. `update_rows` needs
+the identical guard (same acceptance criterion, same escape hatch). Rather than copy
+the four lines into `updateRows.ts` — which is exactly the kind of drift that lets one
+copy get hardened later while the other doesn't — `parseQualifiedName`,
+`quoteIdentifier`, and a new `requireWhereOrConfirm` were pulled out into
+`src/tools/writeStatements.ts`, and `delete_rows` was switched to call the shared
+version too (`tests/writeStatements.test.ts` asserts the DELETE and UPDATE call sites
+produce byte-identical error codes/messages modulo the verb/gerund passed in, and that
+generalizing it didn't quietly loosen it — `1=1` still counts as "has a WHERE clause,"
+no tautology detection was added). `insert_rows` doesn't call this at all: INSERT has
+no WHERE clause, so the guard simply doesn't apply — per the ticket, not a gap.
+
+### The ROWSET_CHANGED digest check cannot apply to INSERT — this is a core gap, not a workaround site
+
+Wiring `insert_rows` straight through `TwoPhaseWrite` (as the ticket asks — "if either
+tool needs to reach around the core, that's a signal the core has a gap") immediately
+failed every execute_plan call against a table with any server-generated default
+column (a `serial`/`identity` primary key, in the test tables): `execute()` always
+raised `ROWSET_CHANGED`.
+
+The reason: `rows_digest` is computed by hashing the `RETURNING *` rows, and is meant
+to catch "the set of rows this statement matches changed between preview and execute"
+for DELETE/UPDATE's WHERE-matched rows. For INSERT there is no pre-existing matched
+row set to compare — the RETURNING content is freshly generated every execution, most
+visibly a `serial` column's `nextval()`. Critically, the *preview* itself is a real
+(rolled-back) INSERT, so it already consumes a sequence value; the execute's real
+INSERT then consumes the *next* one. The preview's digest and the execute's digest are
+therefore guaranteed to differ for such a table, on every single insert, which is not
+the concurrent-modification signal this check exists to catch — it would make
+`insert_rows` permanently broken against any table with an identity/serial column, not
+occasionally trip on genuine concurrent activity.
+
+Fix (in `writeCore.ts`, not worked around per-tool): `execute()` now skips the digest
+equality check when the statement is an INSERT (`isInsertStatement()`, a leading-
+keyword check). `execute_plan` does receive `statement`/`params` back from the agent —
+they aren't confined to `src/tools/*.ts` — but `TokenStore.consume()` recomputes
+`statementFingerprint(statement, params)` and rejects any mismatch before execution, so
+`isInsertStatement()` only ever runs against the exact statement that was previewed,
+never an agent-substituted one. The digest is still computed and stored either way (no
+separate code path in the SQL itself); only the comparison is conditional. What INSERT still gets from the core,
+unchanged: preview-then-rollback with an exact count and RETURNING sample,
+`statementFingerprint` binding the token to the exact statement + params (so
+execute_plan cannot be tricked into inserting something other than what was
+previewed), single-use/expiring tokens, the approval threshold and hard cap, and full
+audit logging on every path. What it deliberately does not get, because it cannot
+mean anything for INSERT: protection against "someone else changed the matched rows
+since I looked" — there is no antecedent "matched rows" for a literal VALUES list.
+
+### Sequence gap is a documented side effect, not a bug to route around
+
+A rolled-back `insert_rows` preview permanently advances any sequence the inserted
+columns default from — Postgres sequences are non-transactional by design, so this is
+not fixable (and not desirable to fix) from application code. `tests/insertRows.test.ts`
+has a test asserting the gap is real (a later actually-executed insert's id jumps by
+more than 1 across a preview-only insert in between). Documented in the README rather
+than treated as a defect.
+
+### update_rows: WHERE params first, SET params appended after — no renumbering of caller SQL
+
+`update_rows` accepts `set` (a column→value object) and `where` (raw SQL text using
+`$1, $2, ...`, identical in spirit to `delete_rows`'s `where`/`params`). Both need
+parameters, and Postgres has one flat `$n` parameter list per statement. Two options:
+(a) renumber the caller's WHERE placeholders to make room for SET's, or (b) keep the
+caller's WHERE placeholders exactly as given and append SET's values after them. (b)
+was picked — it never touches or reparses the caller-supplied WHERE text (lower risk:
+a renumbering pass is itself a small SQL parser that could get a corner case wrong),
+at the cost of the WHERE clause's `$1..$M` params being written first and SET's
+`$(M+1)..` last in the final statement, which is purely an implementation detail the
+agent never has to reason about (it only ever gets `params` back from the preview and
+replays them verbatim, the same as every other tool here).
+
+---
+
 ## 2026-08-13 — Localhost approval UI: reject as a tombstone, pending-plan data stored on the token, one HTTP surface with no framework
 
 **Ticket:** #7 (localhost approval UI with approve and reject). Builds directly on the

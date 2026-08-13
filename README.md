@@ -302,7 +302,7 @@ Stated plainly, not hidden:
 
 ## Publishing to the MCP Registry
 
-`server.json` is the committed manifest for the official [MCP Registry](https://registry.modelcontextprotocol.io). `tests/serverJson.test.ts` checks it stays valid against the registry's schema and in sync with `package.json` — its `name` must equal the `mcpName` field in `package.json`, which is the npm ownership-verification marker the registry checks on publish.
+`server.json` is the committed manifest for the official [MCP Registry](https://registry.modelcontextprotocol.io). `tests/serverJson.test.ts` checks it carries the registry schema URL and the key manifest properties (reverse-DNS name, version, npm package entry, `stdio` transport, required env vars), and keeps it in sync with `package.json` — its `name` must equal the `mcpName` field in `package.json`, which is the npm ownership-verification marker the registry checks on publish.
 
 Publishing is a CLI flow (not a GitHub PR) and requires the npm package to already exist:
 

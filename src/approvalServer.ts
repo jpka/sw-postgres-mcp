@@ -114,6 +114,12 @@ function stringField(body: Record<string, unknown>, key: string): string | null 
  * directly) never send them, and that's a normal, legitimate way to reach
  * this server — only a *mismatched* value is evidence of a cross-origin
  * request.
+ *
+ * `Sec-Fetch-Site` may legitimately be `same-origin` (a fetch from the page
+ * itself) or `none` (direct user navigation: typing the URL in the address
+ * bar, a bookmark, a link opened from outside the browser) — only `cross-site`
+ * (or `same-site` from a sibling origin) is evidence of a background request
+ * planted by another page.
  */
 function checkRequestProvenance(req: http.IncomingMessage): string | null {
   const expectedHost = `${LOOPBACK_HOST}:${req.socket.localPort}`;
@@ -128,8 +134,8 @@ function checkRequestProvenance(req: http.IncomingMessage): string | null {
   }
 
   const secFetchSite = req.headers["sec-fetch-site"];
-  if (typeof secFetchSite === "string" && secFetchSite !== "same-origin") {
-    return `Sec-Fetch-Site "${secFetchSite}" is not same-origin`;
+  if (typeof secFetchSite === "string" && secFetchSite !== "same-origin" && secFetchSite !== "none") {
+    return `Sec-Fetch-Site "${secFetchSite}" is not same-origin or none`;
   }
 
   return null;

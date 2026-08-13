@@ -578,6 +578,13 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
     expect(resp.status).toBe(200);
   });
 
+  it("still serves a direct address-bar navigation with Sec-Fetch-Site: none", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`, {
+      headers: { "Sec-Fetch-Site": "none" },
+    });
+    expect(resp.status).toBe(200);
+  });
+
   it("sets Cache-Control: no-store on both JSON and HTML responses", async () => {
     const jsonResp = await fetch(`${baseUrl}/api/plans`);
     expect(jsonResp.headers.get("cache-control")).toBe("no-store");

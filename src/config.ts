@@ -18,9 +18,22 @@ export interface AllowlistConfig {
   write: AllowlistSection;
 }
 
+export interface WriteConfig {
+  /** How long a plan token stays valid, in milliseconds. Default 60_000. */
+  planTtlMs: number;
+  /** Per-connection statement_timeout for write executions, in milliseconds. Default 10_000. */
+  statementTimeoutMs: number;
+}
+
+export const DEFAULT_WRITE_CONFIG: WriteConfig = {
+  planTtlMs: 60_000,
+  statementTimeoutMs: 10_000,
+};
+
 export interface AppConfig {
   database: DatabaseConfig;
   allowlist: AllowlistConfig;
+  write: WriteConfig;
 }
 
 function parseAllowlistSection(raw: unknown): AllowlistSection {
@@ -95,6 +108,31 @@ export function loadConfig(configPath?: string): AppConfig {
   const r = (raw ?? {}) as Record<string, unknown>;
   const dbRaw = (r.database ?? {}) as Record<string, unknown>;
   const allowRaw = (r.allowlist ?? {}) as Record<string, unknown>;
+  const writeRaw = (r.write ?? {}) as Record<string, unknown>;
+
+  const positiveIntOrThrow = (value: unknown, setting: string): number | undefined => {
+    if (value === undefined || value === null || value === "") return undefined;
+    if (typeof value === "number") {
+      if (Number.isInteger(value) && value > 0) return value;
+    } else if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+      const n = Number(value);
+      if (Number.isSafeInteger(n) && n > 0) return n;
+    }
+    throw new Error(
+      `write.${setting} must be a positive integer, got ${JSON.stringify(value)}`,
+    );
+  };
+
+  const write: WriteConfig = {
+    planTtlMs:
+      positiveIntOrThrow(process.env.SW_PLAN_TTL_MS, "planTtlMs") ??
+      positiveIntOrThrow(writeRaw.planTtlMs, "planTtlMs") ??
+      DEFAULT_WRITE_CONFIG.planTtlMs,
+    statementTimeoutMs:
+      positiveIntOrThrow(process.env.SW_STATEMENT_TIMEOUT_MS, "statementTimeoutMs") ??
+      positiveIntOrThrow(writeRaw.statementTimeoutMs, "statementTimeoutMs") ??
+      DEFAULT_WRITE_CONFIG.statementTimeoutMs,
+  };
 
   // Allowlist supports both nested {read, write} and legacy flat keys for backwards compat
   let allowlist: AllowlistConfig;
@@ -158,5 +196,5 @@ export function loadConfig(configPath?: string): AppConfig {
     );
   }
 
-  return { database, allowlist };
+  return { database, allowlist, write };
 }

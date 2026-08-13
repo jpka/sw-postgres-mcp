@@ -103,15 +103,38 @@ docker compose up -d --wait
 npm test
 ```
 
-Integration tests verify against a live Postgres: role separation, readonly cannot write, `describe_schema` fields, allowlist filtering, and the demo-database seeder's row-count shape (`tests/seedDemo.test.ts` actually runs `npm run seed:demo` and queries the results back). `tests/approvalUi.test.ts` starts the localhost approval HTTP server for real (on an OS-assigned port) and drives it with plain `fetch()` — no browser automation — covering the pending-plan listing, the approve/reject HTTP endpoints end-to-end (including unlocking and permanently killing `execute_plan`), the loopback-only bind, audit rows, expired-plan filtering, and that the surface works with no MCP client connected at all.
+Integration tests verify against a live Postgres: role separation, readonly cannot write, `describe_schema` fields, allowlist filtering, and the demo-database seeder's row-count shape (`tests/seedDemo.test.ts` actually runs `npm run seed:demo` and queries the results back). `tests/approvalUi.test.ts` starts the localhost approval HTTP server for real (on an OS-assigned port) and drives it with plain `fetch()` — no browser automation — covering the pending-plan listing, the approve/reject HTTP endpoints end-to-end (including unlocking and permanently killing `execute_plan`), the loopback-only bind, audit rows, expired-plan filtering, and that the surface works with no MCP client connected at all. `tests/insertRows.test.ts` and `tests/updateRows.test.ts` cover the same preview→token→execute discipline, the approval threshold/hard cap, the write allowlist, audit logging, SQL-injection-shaped inputs, and (for inserts) the sequence-gap behavior, for the two newer write tools; `tests/writeStatements.test.ts` unit-tests the no-`WHERE` guard the two DELETE/UPDATE tools share.
 
 ## Tools
 
 - `describe_schema` — tables, columns with types, foreign keys, row-count estimates (respects read allowlist).
 - `query` — run a read-only `SELECT` and return `{ columns, rows, row_count }`. Runs on the readonly role, so a mutating statement is refused by the database regardless of what the SQL says. Enforces a single statement per call and the read allowlist. Optional `limit` and `params`.
 - `explain_plan` — run `EXPLAIN (FORMAT JSON)` for a candidate read statement and return the planner's estimated `cost` and `rows` without executing it. A cheap pre-check before running something potentially expensive.
-- `delete_rows` — **two-phase delete**. Runs the statement inside a transaction, returns the exact affected row count plus a sample of affected rows, then rolls back. The response includes a `plan_token`, the exact `statement`, and `params` — and a `status` of `previewed` or `awaiting_approval` (see [Approval threshold and hard row cap](#approval-threshold-and-hard-row-cap) below).
-- `execute_plan` — commits a previously previewed write. Pass back the `plan_token`, `statement`, and `params` from the preview response. Refused (`AWAITING_APPROVAL`) if the plan is still awaiting approval, or (`PLAN_REJECTED`) if a human rejected it via the [localhost approval UI](#localhost-approval-ui).
+- `delete_rows` — **two-phase delete**. Runs the statement inside a transaction, returns the exact affected row count plus a sample of affected rows, then rolls back. The response includes a `plan_token`, the exact `statement`, and `params` — and a `status` of `previewed` or `awaiting_approval` (see [Approval threshold and hard row cap](#approval-threshold-and-hard-row-cap) below). Refuses a statement with no `WHERE` clause unless `confirm_full_table: true` is passed.
+- `insert_rows` — **two-phase insert**. Takes `table`, `columns` (an array of column names), and `rows` (an array of value-arrays, one per row, positional against `columns`), plus `reason`. Runs the `INSERT ... VALUES (...), (...) RETURNING *` inside a transaction, returns the exact row count and a sample of the rows it would insert, then rolls back. See [Sequence values and rolled-back inserts](#sequence-values-and-rolled-back-inserts) below for a side effect worth knowing about. Example:
+  ```json
+  {
+    "table": "customers",
+    "columns": ["email", "active"],
+    "rows": [
+      ["a@example.com", true],
+      ["b@example.com", false]
+    ],
+    "reason": "seeding two test accounts"
+  }
+  ```
+- `update_rows` — **two-phase update**. Takes `table`, `set` (a `{ "column": value, ... }` object of what to change), `where` + `params` (parameterized WHERE conditions, same convention as `delete_rows`), `confirm_full_table`, and `reason`. Runs the `UPDATE ... SET ... WHERE ... RETURNING *` inside a transaction, returns the exact affected row count and a post-update sample, then rolls back. Refuses a statement with no `WHERE` clause unless `confirm_full_table: true` is passed — the exact same guard `delete_rows` uses (`src/tools/writeStatements.ts`), not a reimplementation. Example:
+  ```json
+  {
+    "table": "customers",
+    "set": { "active": false },
+    "where": "last_login < $1",
+    "params": ["2025-01-01"],
+    "reason": "deactivating accounts inactive since before 2025"
+  }
+  ```
+  Column names in `set` are always quoted identifiers and values are always `$n` parameters — never string-concatenated into the statement — so a crafted column name or value cannot inject SQL; a malformed column name simply fails as an unknown column.
+- `execute_plan` — commits a previously previewed write. Pass back the `plan_token`, `statement`, and `params` from the preview response (`delete_rows`, `insert_rows`, or `update_rows`). Refused (`AWAITING_APPROVAL`) if the plan is still awaiting approval, or (`PLAN_REJECTED`) if a human rejected it via the [localhost approval UI](#localhost-approval-ui).
 
 There is deliberately no `approve_plan` or `reject_plan` (or any other approval) tool in this list. Approving or rejecting an `awaiting_approval` plan is **not** exposed to the agent — see [Localhost approval UI](#localhost-approval-ui) below for why and how it's meant to be used instead.
 
@@ -119,12 +142,22 @@ Every tool takes a `reason` string (recorded in the audit log — see below) and
 
 ### Two-phase writes
 
-The agent must commit to a preview before it can execute:
+`delete_rows`, `insert_rows`, and `update_rows` all go through the exact same core (`TwoPhaseWrite` in `src/writeCore.ts`) — the agent must commit to a preview before it can execute:
 
-1. `delete_rows` runs the statement in a transaction, captures the exact affected row count and a sample of affected rows via `RETURNING`, then **rolls back**. Nothing has changed in the database.
-2. `execute_plan` replays the identical statement and commits — but only if the token is valid, unexpired, unused, bound to the exact statement + params from the preview, the affected row set still matches the preview, and (see below) the plan is not still awaiting approval.
+1. The tool runs the statement in a transaction, captures the exact affected/inserted row count and a sample of affected rows via `RETURNING`, then **rolls back**. Nothing has changed in the database.
+2. `execute_plan` replays the identical statement and commits — but only if the token is valid, unexpired, unused, and bound to the exact statement + params from the preview. For `delete_rows`/`update_rows`, it also refuses to commit if the *matched* row set changed since the preview (`ROWSET_CHANGED`) — and (see below) the plan must not still be awaiting approval.
 
-A `DELETE` without a `WHERE` clause is refused unless `confirm_full_table: true` is passed. Every write runs through the `writer` pool; the `readonly` pool is never used for a mutation.
+A `DELETE`/`UPDATE` without a `WHERE` clause is refused unless `confirm_full_table: true` is passed — one guard, shared by both tools (`src/tools/writeStatements.ts`), not two copies that could drift. `INSERT` has no `WHERE` clause, so this guard doesn't apply to `insert_rows`. Every write runs through the `writer` pool; the `readonly` pool is never used for a mutation.
+
+The `ROWSET_CHANGED` check is deliberately skipped for `insert_rows`: that check exists to catch "the rows a WHERE clause matches changed between preview and execute," which has no equivalent for INSERT — there's no pre-existing row set to match. `insert_rows` still gets everything else the core provides (the exact statementFingerprint binding, single-use/expiring tokens, the approval threshold and hard cap, and full audit logging); see `DECISIONS.md` for why comparing RETURNING digests across an INSERT's preview and execute would otherwise refuse the write on every single call against a table with a server-generated column.
+
+### Sequence values and rolled-back inserts
+
+Because `insert_rows`'s preview is a real `INSERT ... RETURNING *` that then **rolls back**, any `serial`/`identity`/other sequence-backed default on the target table's columns still advances — Postgres sequences are not transactional, so a rollback does not return a consumed sequence value. This means:
+
+- Previewing an insert (even one you never execute) permanently uses up one or more values from that column's sequence.
+- The `id` (or similar) shown in the preview's `sample_rows` is illustrative, not a promise — the row actually committed by `execute_plan` will very likely get a *different* sequence-generated value, since the preview's own rollback already consumed the one shown.
+- This shows up as gaps in serial columns over time (e.g. ids `1, 2, 5, 6` instead of `1, 2, 3, 4`) purely from previews, whether or not they were ever executed. This is harmless — Postgres sequences have never guaranteed gap-free values, even without this tool — but worth knowing about before treating a serial column as a dense counter.
 
 ### Approval threshold and hard row cap
 

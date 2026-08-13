@@ -537,11 +537,16 @@ because the planner estimated 80. That failure mode is silent — nothing about 
 wrong until the numbers are compared after the fact — which is the opposite of what an
 approval gate is for.
 
-(b) was picked: `TwoPhaseWrite.preview()` wraps the statement as
+(b) was picked: for the DML tools (`delete_rows`/`insert_rows`/`update_rows`),
+`TwoPhaseWrite.preview()` wraps the statement as
 `WITH _affected AS (${statement} RETURNING *) SELECT count(*), sample_rows, rows_digest ...`,
 runs it for real inside a transaction, then rolls back. The row count in every preview
 response is the exact count a real execution just produced — not a projection of one.
-This is strictly more expensive than `EXPLAIN` (a real execution, rolled back, followed
+(DDL, added later by #9's `run_migration`, has no `RETURNING` to wrap: its preview runs
+the statement directly inside `BEGIN … ROLLBACK` and reports 0 affected rows plus a
+`target` extracted from the statement text — see #9's entry above. DDL's safety comes
+from *always* requiring approval regardless of that row count, not from this exact-count
+mechanism.) This is strictly more expensive than `EXPLAIN` (a real execution, rolled back, followed
 later by another real execution to commit), which is accepted deliberately: correctness of
 the row count is the entire point of the safety layer, and `EXPLAIN`'s only remaining job
 is the separate, explicitly-cheap `explain_plan` tool — a pre-check an agent can call

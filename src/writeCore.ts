@@ -25,7 +25,8 @@ export type WriteErrorCode =
   | "INVALID_INPUT"
   | "AWAITING_APPROVAL"
   | "HARD_MAX_ROWS_EXCEEDED"
-  | "PLAN_REJECTED";
+  | "PLAN_REJECTED"
+  | "APPROVAL_UNAVAILABLE";
 
 export class WriteError extends Error {
   readonly code: WriteErrorCode;
@@ -109,6 +110,17 @@ export interface TwoPhaseWriteOptions {
    * Default 10_000 (see config.ts DEFAULT_WRITE_CONFIG).
    */
   hardMaxRows?: number;
+  /**
+   * Whether a human approval surface exists in this deployment (the
+   * localhost approval server, ticket #7). Default true. When false, a
+   * preview that would require approval (`alwaysRequireApproval`, or an
+   * affected-row count above `approvalRequiredAboveRows`) is refused
+   * outright instead of issuing a gated plan — with no approval server
+   * there is no way to ever approve such a plan, so `execute_plan` could
+   * only block until the token expires. Wire this to
+   * `config.approvalServer.enabled` at startup (see src/index.ts).
+   */
+  approvalAvailable?: boolean;
   /** Identity recorded as `caller_id` on every audit row this instance writes. Default "unknown". */
   callerId?: string;
   /** Audit sink. Defaults to an `AuditLog` writing through `pool` (the writer role). */
@@ -218,6 +230,7 @@ export class TwoPhaseWrite {
   private callerId: string;
   private approvalRequiredAboveRows: number;
   private hardMaxRows: number;
+  private approvalAvailable: boolean;
 
   constructor(private opts: TwoPhaseWriteOptions) {
     this.store = new PostgresPlanStore({
@@ -229,6 +242,7 @@ export class TwoPhaseWrite {
     this.approvalRequiredAboveRows =
       opts.approvalRequiredAboveRows ?? DEFAULT_APPROVAL_REQUIRED_ABOVE_ROWS;
     this.hardMaxRows = opts.hardMaxRows ?? DEFAULT_HARD_MAX_ROWS;
+    this.approvalAvailable = opts.approvalAvailable ?? true;
   }
 
   /**
@@ -309,6 +323,23 @@ export class TwoPhaseWrite {
           "HARD_MAX_ROWS_EXCEEDED",
           `This statement would affect ${affectedRows} rows, above the hard cap of ${this.hardMaxRows}. No plan token was issued and there is no approval path for this — it cannot be executed as written.`,
           "Rewrite the statement to affect fewer rows (e.g. a narrower WHERE clause or batching), then re-preview.",
+        );
+      }
+
+      // With no approval surface configured (approvalServer.enabled: false),
+      // a plan that would require human approval is a dead end: execute_plan
+      // would block on it until the token expires because nothing can ever
+      // approve it. Refuse such previews outright instead of issuing the
+      // plan — same wall-not-gate shape as the hard cap above (see
+      // src/index.ts wiring this to config.approvalServer.enabled).
+      const requiresApproval =
+        affectedRows > this.approvalRequiredAboveRows ||
+        meta.alwaysRequireApproval === true;
+      if (requiresApproval && !this.approvalAvailable) {
+        throw new WriteError(
+          "APPROVAL_UNAVAILABLE",
+          `This plan requires human approval, but the approval server is disabled in this deployment's config (approvalServer.enabled: false) — there is no way to approve it. No plan token was issued.`,
+          "Enable the approval server (approvalServer.enabled: true) or configure an approval path, then re-preview.",
         );
       }
 
@@ -393,7 +424,21 @@ export class TwoPhaseWrite {
     params: readonly unknown[],
   ): Promise<ExecuteResult> {
     const startedAt = Date.now();
-    const consumed = this.store.consume(planToken, payloadFor(statement, params));
+    const payload = payloadFor(statement, params);
+
+    // A gated plan still awaiting human approval blocks this call until a
+    // human approves, rejects, or the plan expires, so the out-of-band
+    // decision surfaces here on the in-flight call instead of requiring the
+    // agent to re-call execute_plan later. The core's consume() deliberately
+    // does not mark a token used on an AWAITING_APPROVAL refusal, so
+    // re-consuming after the wait is safe. Any other consume() outcome is
+    // final (a success already marks the token used), so it is only ever
+    // re-consumed through the awaiting-approval branch.
+    let consumed = this.store.consume(planToken, payload);
+    if (!consumed.ok && consumed.error.code === "AWAITING_APPROVAL") {
+      await this.waitForApprovalOutcome(planToken);
+      consumed = this.store.consume(planToken, payload);
+    }
     // A token that never existed (or expired before this call) has no stored
     // meta to recover — fall back to generic attribution so the attempt is
     // still audited rather than dropped.
@@ -675,6 +720,30 @@ export class TwoPhaseWrite {
       durationMs: Date.now() - startedAt,
       callerId: view.callerId,
     });
+  }
+
+  /**
+   * Blocks while `planToken` is still awaiting a human decision (approved,
+   * rejected, or expired), so the caller's in-flight execute_plan call can
+   * surface the out-of-band approval outcome directly. Polls
+   * `PlanStore.listPending()` — the public, canonical "still awaiting a human
+   * decision" view — on a 100 ms interval. Bounded by the plan TTL plus a small
+   * grace period so an unchosen plan can never hold the call open forever;
+   * once the wait ends, the subsequent consume() reports the final state
+   * (approved → executes, rejected → PLAN_REJECTED, expired → EXPIRED_TOKEN).
+   */
+  private async waitForApprovalOutcome(planToken: string): Promise<void> {
+    // The plan expires planTtlMs after its preview, and execute() is only
+    // called after that preview returned, so the remaining wait is at most
+    // the TTL plus a small grace period.
+    const deadline = Date.now() + this.opts.planTtlMs + 1_000;
+    while (Date.now() < deadline) {
+      const stillPending = this.store
+        .listPending()
+        .some((p) => p.planToken === planToken);
+      if (!stillPending) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   }
 
   private previewSql(statement: string): string {

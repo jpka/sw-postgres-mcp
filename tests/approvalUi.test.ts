@@ -225,12 +225,15 @@ describe("localhost approval UI (#7)", () => {
     const { body } = parseToolResult(preview as never);
     expect(body.status).toBe("awaiting_approval");
 
-    // Refused before approval, exactly like the MCP-only path already tests.
-    const refused = await client.callTool({
+    // execute_plan BLOCKS while the plan awaits approval, so the approve
+    // below (which lands while this call is in flight) is what unblocks it.
+    const execPromise = client.callTool({
       name: "execute_plan",
       arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
     });
-    expect(parseToolResult(refused as never).body.code).toBe("AWAITING_APPROVAL");
+    // Give the server time to consume, see AWAITING_APPROVAL, and enter its
+    // wait loop before the human decision lands.
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     const approveResp = await fetch(
       `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`,
@@ -250,27 +253,21 @@ describe("localhost approval UI (#7)", () => {
     };
     expect(listAfter.plans.find((p) => p.plan_token === body.plan_token)).toBeUndefined();
 
-    const exec = await client.callTool({
-      name: "execute_plan",
-      arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
-    });
+    const exec = await execPromise;
     const execParsed = parseToolResult(exec as never);
     expect(execParsed.isError).toBe(false);
     expect(execParsed.body.status).toBe("executed");
     expect(execParsed.body.affected_rows).toBe(4);
     expect(await countRows()).toBe(16);
 
-    const rows = await auditRowsForReason(reason);
-    // Includes the refused pre-approval execute_plan attempt above (audited
-    // as "failed") alongside the preview, approval, and final execution.
-    expect(rows.map((r) => r.status)).toEqual([
-      "awaiting_approval",
-      "failed",
-      "approved",
-      "executed",
-    ]);
-    expect(rows[2].approved_by).toBe("reviewer@example.com");
-    expect(rows[2].plan_token).toBe(body.plan_token);
+    // The approve's audit row and the execute's final audit row are written
+    // concurrently (the HTTP response returns before the onDecision audit
+    // hook fires), so compare statuses as an unordered set.
+    const rows = await waitForAuditRows(reason, 3);
+    const statuses = rows.map((r) => r.status);
+    expect(statuses.sort()).toEqual(["approved", "awaiting_approval", "executed"].sort());
+    expect(rows.find((r) => r.status === "approved")!.approved_by).toBe("reviewer@example.com");
+    expect(rows.find((r) => r.status === "approved")!.plan_token).toBe(body.plan_token);
   });
 
   it("AC3 + AC5: rejecting via the HTTP endpoint permanently kills the token and writes a rejected audit row", async () => {
@@ -344,6 +341,56 @@ describe("localhost approval UI (#7)", () => {
     expect(rows[1].approved_by).toBe("reviewer@example.com");
     expect(rows[1].plan_token).toBe(body.plan_token);
     expect(await countRows()).toBe(20);
+  });
+
+  it("AC3b: rejecting via the HTTP endpoint while execute_plan is awaiting surfaces PLAN_REJECTED on that in-flight call", async () => {
+    const reason = `ui-reject-inflight-${randomUUID()}`;
+    const preview = await client.callTool({
+      name: "delete_rows",
+      arguments: { table: TABLE, where: "id <= 4", reason },
+    });
+    const { body } = parseToolResult(preview as never);
+    expect(body.status).toBe("awaiting_approval");
+
+    // execute_plan BLOCKS while the plan awaits approval, so the reject below
+    // (which lands while this call is in flight) is what unblocks it — and
+    // the PLAN_REJECTED error surfaces on this very call, not on a later retry.
+    const execPromise = client.callTool({
+      name: "execute_plan",
+      arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
+    });
+    // Give the server time to consume, see AWAITING_APPROVAL, and enter its
+    // wait loop before the human decision lands.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const rejectResp = await fetch(
+      `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/reject`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rejectedBy: "reviewer@example.com",
+          reason: "too broad, narrow the WHERE clause",
+        }),
+      },
+    );
+    expect(rejectResp.status).toBe(200);
+    expect(((await rejectResp.json()) as { ok: boolean }).ok).toBe(true);
+
+    const exec = await execPromise;
+    const execParsed = parseToolResult(exec as never);
+    expect(execParsed.isError).toBe(true);
+    expect(execParsed.body.code).toBe("PLAN_REJECTED");
+    expect(execParsed.body.code).not.toBe("AWAITING_APPROVAL");
+    expect(execParsed.body.message as string).toMatch(/too broad, narrow the WHERE clause/);
+    expect(await countRows()).toBe(20);
+
+    // The rejection's audit row and the execute's failed audit row are
+    // written concurrently, so compare statuses as an unordered set.
+    const rows = await waitForAuditRows(reason, 3);
+    const statuses = rows.map((r) => r.status);
+    expect(statuses.sort()).toEqual(["awaiting_approval", "rejected", "failed"].sort());
+    expect(rows.find((r) => r.status === "rejected")!.approved_by).toBe("reviewer@example.com");
   });
 
   it("rejecting a plan the agent never previewed (unknown token) is a structured 404, not a crash", async () => {

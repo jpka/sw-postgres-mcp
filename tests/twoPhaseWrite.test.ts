@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import pg from "pg";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -357,6 +358,43 @@ describe("two-phase write core", () => {
     const parsed = parseToolResult(result as never);
     expect(parsed.isError).toBe(true);
     expect(JSON.parse(parsed.text).code).toBe("TABLE_NOT_WRITABLE");
+  });
+
+  it("execute_plan blocks while a gated plan awaits approval: an in-flight rejection surfaces as PLAN_REJECTED, an in-flight approval executes", async () => {
+    const tw = new TwoPhaseWrite({
+      pool: writerPool,
+      planTtlMs: 5_000,
+      statementTimeoutMs: 10_000,
+      // 2: the `active = true` delete matches 3 of the 5 seeded rows (a, b, e),
+      // so a 3-row delete sits above this threshold and gates on approval.
+      approvalRequiredAboveRows: 2,
+      hardMaxRows: 100,
+    });
+    const reason = `tw-wait-${randomUUID()}`;
+    const preview = await tw.preview(`DELETE FROM ${TABLE} WHERE active = true`, [], {
+      tool: "delete_rows",
+      reason,
+    });
+    expect(preview.status).toBe("awaiting_approval");
+
+    // Reject while the execute is in flight.
+    const rejectedExec = tw.execute(preview.planToken, preview.statement, preview.params);
+    await new Promise((r) => setTimeout(r, 50));
+    await tw.rejectPlan(preview.planToken, "no");
+    await expect(rejectedExec).rejects.toMatchObject({ code: "PLAN_REJECTED" });
+    expect(await countRows()).toBe(5);
+
+    // Approve while the execute is in flight.
+    const preview2 = await tw.preview(`DELETE FROM ${TABLE} WHERE active = true`, [], {
+      tool: "delete_rows",
+      reason: `${reason}-2`,
+    });
+    expect(preview2.status).toBe("awaiting_approval");
+    const approvedExec = tw.execute(preview2.planToken, preview2.statement, preview2.params);
+    await new Promise((r) => setTimeout(r, 50));
+    await tw.approvePlan(preview2.planToken, "reviewer@example.com");
+    await expect(approvedExec).resolves.toMatchObject({ affectedRows: 3 });
+    expect(await countRows()).toBe(2);
   });
 });
 

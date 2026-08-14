@@ -5,6 +5,18 @@ were, what we picked, and the reasoning a reviewer can check. Newest first.
 
 ---
 
+## 2026-08-14 — execute_plan blocks while a plan awaits approval: the rejection (or approval) surfaces on the in-flight call
+
+The reported bug: a human clicking "Reject" in the localhost approval UI killed the token server-side (store tombstone, `rejected` audit row, `PLAN_REJECTED` on the next consume), but nothing surfaced to the agent in Claude Desktop. After a preview returned `status: "awaiting_approval"`, the tool message told the agent to "wait for approval", so the agent's turn ended and it idled; there is no push channel over MCP stdio, so the agent only learned of a rejection if it happened to re-call `execute_plan` on its own — which the "wait" guidance gave it no reason to do.
+
+The fix changes `TwoPhaseWrite.execute()`'s semantics from refuse-now to wait-until-decided. `execute()` consumes first; on an `AWAITING_APPROVAL` refusal it waits — polling the core's public `listPending()` on a 100 ms interval, bounded by the plan TTL plus a small grace period so an unchosen plan can never hold the call open forever — then re-consumes. The core's `consume()` deliberately does not mark a token used on an `AWAITING_APPROVAL` refusal, so the re-consume is safe: an approval lets the statement execute, a rejection returns `PLAN_REJECTED` with the human's reason, and an expiry returns `EXPIRED_TOKEN`.
+
+The preview and migration messages now instruct the agent to call `execute_plan` to await the human's decision — the out-of-band approve/reject lands on that held-open call instead of being invisible until a lucky retry. That is what makes the demo beat "reject the plan, watch the agent adapt" work without any client-side push channel: since Claude Desktop implements no spec-native elicitation (see the 2026-08-12 entry), a held-open tool call is the one in-band mechanism that can surface an out-of-band decision.
+
+Trade-offs: a waiting call is bounded by the remaining TTL, so it cannot hang forever; the single-use/expiry/fingerprint guarantees are unchanged, since `consume()` is what actually transitions the token; a waiting-then-approved call no longer writes the spurious pre-approval `failed` audit row (there is no refused attempt to audit), and a waiting-then-rejected call writes exactly one `failed` row for the refusal.
+
+---
+
 ## 2026-08-13 — Consuming safe-write-mcp-core (#26): the token lifecycle and the approval HTTP server now live in the shared package
 
 **Ticket:** #26 — prove the extracted core generalizes by having this server consume

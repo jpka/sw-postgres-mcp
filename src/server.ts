@@ -98,7 +98,7 @@ function previewResponse(
 ) {
   const message =
     preview.status === "awaiting_approval"
-      ? `This plan affects ${preview.affectedRows} rows, above the approval threshold of ${approvalRequiredAboveRows}. It requires human approval through an out-of-band approval surface before execute_plan will succeed — wait for approval, or narrow the statement and re-preview.`
+      ? `This plan affects ${preview.affectedRows} rows, above the approval threshold of ${approvalRequiredAboveRows}. It requires human approval through the localhost approval UI before it will execute. Call execute_plan with this plan_token (and the exact statement and params above) to await the human's decision: the call waits until a human approves it (it then executes), rejects it (you receive a structured PLAN_REJECTED error with the rejection reason — narrow the operation and re-preview), or the plan expires.`
       : null;
   return text(
     JSON.stringify(
@@ -138,7 +138,7 @@ function migrationPreviewResponse(preview: WritePreview) {
         affected_rows: preview.affectedRows,
         sample_rows: preview.sampleRows,
         message:
-          "DDL migrations always require human approval through the localhost approval UI before execute_plan will run them, regardless of any row-count threshold.",
+          "DDL migrations always require human approval through the localhost approval UI before execute_plan will run them, regardless of any row-count threshold. Call execute_plan with this plan_token (and the exact statement and params above) to await the human's decision: the call waits until a human approves it (it then executes), rejects it (you receive a structured PLAN_REJECTED error — adjust the migration and re-preview), or the plan expires.",
       },
       null,
       2,
@@ -210,6 +210,7 @@ export function createServer(
     approvalRequiredAboveRows: config.write.approvalRequiredAboveRows,
     hardMaxRows: config.write.hardMaxRows,
     callerId: config.callerId,
+    approvalAvailable: config.approvalServer?.enabled ?? true,
   }),
 ): Server {
   const server = new Server(
@@ -403,7 +404,7 @@ export function createServer(
       {
         name: "execute_plan",
         description:
-          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the preview (delete_rows, insert_rows, update_rows, or run_migration). The token is single-use, expires, and refuses any statement that does not match the preview. For delete_rows and update_rows, it also refuses to commit if the affected row set changed since the preview; insert_rows and run_migration have no matching row set to compare (a rolled-back preview insert still consumes sequence values; DDL has no RETURNING-based row set at all), so both rely on the token's fingerprint, single-use, and expiry guarantees instead. If the preview's affected-row count was above write.approvalRequiredAboveRows (or, for run_migration, unconditionally), execution refuses until a human approves it through an out-of-band approval surface (not available through this MCP tool set).",
+          "Execute a previously previewed write. Pass the exact plan_token, statement, and params from the preview (delete_rows, insert_rows, update_rows, or run_migration). The token is single-use, expires, and refuses any statement that does not match the preview. For delete_rows and update_rows, it also refuses to commit if the affected row set changed since the preview; insert_rows and run_migration have no matching row set to compare (a rolled-back preview insert still consumes sequence values; DDL has no RETURNING-based row set at all), so both rely on the token's fingerprint, single-use, and expiry guarantees instead. If the preview was awaiting approval (above write.approvalRequiredAboveRows, or unconditionally for run_migration), this call waits until a human approves or rejects it through an out-of-band approval surface (not available through this MCP tool set) — an approval lets it execute, a rejection returns a structured PLAN_REJECTED error, and an expired plan returns EXPIRED_TOKEN.",
         inputSchema: {
           type: "object",
           properties: {

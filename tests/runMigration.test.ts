@@ -265,16 +265,6 @@ describe("run_migration (#9)", () => {
     // Rolled back — the preview must not have left the table behind.
     expect(await tableExists(table)).toBe(false);
 
-    // Refused before approval, exactly like the data write tools.
-    const refused = await client.callTool({
-      name: "execute_plan",
-      arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
-    });
-    const refusedParsed = parseToolResult(refused as never);
-    expect(refusedParsed.isError).toBe(true);
-    expect(refusedParsed.body.code).toBe("AWAITING_APPROVAL");
-    expect(await tableExists(table)).toBe(false);
-
     // Approve through the real HTTP endpoint — not TwoPhaseWrite called directly.
     const approveResp = await fetch(
       `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`,
@@ -300,7 +290,6 @@ describe("run_migration (#9)", () => {
     const rows = await auditRowsForReason(reason);
     expect(rows.map((r) => r.status)).toEqual([
       "awaiting_approval",
-      "failed", // pre-approval execute_plan attempt
       "approved",
       "executed",
     ]);
@@ -308,7 +297,7 @@ describe("run_migration (#9)", () => {
       expect(row.reason).toBe(reason);
     }
     expect(rows[0].tool).toBe("run_migration");
-    expect(rows[2].approved_by).toBe("reviewer@example.com");
+    expect(rows[1].approved_by).toBe("reviewer@example.com");
   });
 
   it("AC3: the pending plan on GET /api/plans and the HTML page show the statement, target, and reason", async () => {

@@ -151,7 +151,7 @@ describe("approval threshold, hard row cap, and awaiting_approval (#6)", () => {
     expect(rows.map((r) => r.status)).toEqual(["previewed", "executed"]);
   });
 
-  it("AC2: a preview above the approval threshold returns awaiting_approval, and execute_plan refuses it while unapproved", async () => {
+  it("AC2: a preview above the approval threshold returns awaiting_approval, and a rejected plan surfaces PLAN_REJECTED on execute_plan", async () => {
     const reason = `awaiting-${randomUUID()}`;
     // 5 rows: above the 3-row approval threshold, at or below the 6-row hard cap.
     const preview = await client.callTool({
@@ -167,17 +167,25 @@ describe("approval threshold, hard row cap, and awaiting_approval (#6)", () => {
     expect(typeof body.message).toBe("string");
     expect(body.message as string).toMatch(/approv/i);
 
-    const refused = await client.callTool({
+    // execute_plan on an unapproved gated plan BLOCKS until a human decides;
+    // a rejection (not a refusal) is what surfaces the PLAN_REJECTED error.
+    // Deterministic reject-then-execute: the reject lands before execute_plan
+    // is even called, so the blocked wait is skipped and consume() reports
+    // PLAN_REJECTED immediately.
+    await write.rejectPlan(body.plan_token as string, "too broad, narrow it");
+
+    const exec = await client.callTool({
       name: "execute_plan",
       arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
     });
-    const refusedParsed = parseToolResult(refused as never);
-    expect(refusedParsed.isError).toBe(true);
-    expect(refusedParsed.body.code).toBe("AWAITING_APPROVAL");
+    const execParsed = parseToolResult(exec as never);
+    expect(execParsed.isError).toBe(true);
+    expect(execParsed.body.code).toBe("PLAN_REJECTED");
+    expect(execParsed.body.code).not.toBe("AWAITING_APPROVAL");
     expect(await countRows()).toBe(20);
 
     const rows = await auditRowsForReason(reason);
-    expect(rows.map((r) => r.status)).toEqual(["awaiting_approval", "failed"]);
+    expect(rows.map((r) => r.status)).toEqual(["awaiting_approval", "rejected", "failed"]);
     expect(rows[0].preview_rows).toBe(5);
     expect(rows[1].plan_token).toBe(body.plan_token);
   });

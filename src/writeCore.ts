@@ -393,7 +393,21 @@ export class TwoPhaseWrite {
     params: readonly unknown[],
   ): Promise<ExecuteResult> {
     const startedAt = Date.now();
-    const consumed = this.store.consume(planToken, payloadFor(statement, params));
+    const payload = payloadFor(statement, params);
+
+    // A gated plan still awaiting human approval blocks this call until a
+    // human approves, rejects, or the plan expires, so the out-of-band
+    // decision surfaces here on the in-flight call instead of requiring the
+    // agent to re-call execute_plan later. The core's consume() deliberately
+    // does not mark a token used on an AWAITING_APPROVAL refusal, so
+    // re-consuming after the wait is safe. Any other consume() outcome is
+    // final (a success already marks the token used), so it is only ever
+    // re-consumed through the awaiting-approval branch.
+    let consumed = this.store.consume(planToken, payload);
+    if (!consumed.ok && consumed.error.code === "AWAITING_APPROVAL") {
+      await this.waitForApprovalOutcome(planToken);
+      consumed = this.store.consume(planToken, payload);
+    }
     // A token that never existed (or expired before this call) has no stored
     // meta to recover — fall back to generic attribution so the attempt is
     // still audited rather than dropped.
@@ -675,6 +689,30 @@ export class TwoPhaseWrite {
       durationMs: Date.now() - startedAt,
       callerId: view.callerId,
     });
+  }
+
+  /**
+   * Blocks while `planToken` is still awaiting a human decision (approved,
+   * rejected, or expired), so the caller's in-flight execute_plan call can
+   * surface the out-of-band approval outcome directly. Polls
+   * `PlanStore.listPending()` — the public, canonical "still awaiting a human
+   * decision" view — on a 100ms interval. Bounded by the plan TTL plus a small
+   * grace period so an unchosen plan can never hold the call open forever;
+   * once the wait ends, the subsequent consume() reports the final state
+   * (approved → executes, rejected → PLAN_REJECTED, expired → EXPIRED_TOKEN).
+   */
+  private async waitForApprovalOutcome(planToken: string): Promise<void> {
+    // The plan expires planTtlMs after its preview, and execute() is only
+    // called after that preview returned, so the remaining wait is at most
+    // the TTL plus a small grace period.
+    const deadline = Date.now() + this.opts.planTtlMs + 1_000;
+    while (Date.now() < deadline) {
+      const stillPending = this.store
+        .listPending()
+        .some((p) => p.planToken === planToken);
+      if (!stillPending) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   }
 
   private previewSql(statement: string): string {

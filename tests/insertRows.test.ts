@@ -410,12 +410,8 @@ describe("insert_rows: approval threshold and hard cap (#8, reusing #6)", () => 
     expect(body.status).toBe("awaiting_approval");
     expect(body.affected_rows).toBe(5);
 
-    const refused = await client.callTool({
-      name: "execute_plan",
-      arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
-    });
-    expect(parseToolResult(refused as never).body.code).toBe("AWAITING_APPROVAL");
-
+    // Approve out-of-band first, then execute: approve-then-execute is
+    // deterministic, so the audit rows keep their exact order.
     await write.approvePlan(body.plan_token as string, "reviewer@example.com");
 
     const exec = await client.callTool({
@@ -430,7 +426,6 @@ describe("insert_rows: approval threshold and hard cap (#8, reusing #6)", () => 
     const rows = await auditRowsForReason(reason);
     expect(rows.map((r) => r.status)).toEqual([
       "awaiting_approval",
-      "failed",
       "approved",
       "executed",
     ]);

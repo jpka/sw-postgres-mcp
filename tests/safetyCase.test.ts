@@ -273,13 +273,21 @@ describe("Safety-case integration matrix (#11)", () => {
       expect(body.status).toBe("awaiting_approval");
       expect(body.plan_token).toBeTruthy();
 
-      const refused = await client.callTool({
+      // execute_plan BLOCKS while the plan awaits approval; the rejection
+      // landing on the in-flight call surfaces as PLAN_REJECTED.
+      const execPromise = client.callTool({
         name: "execute_plan",
         arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
       });
-      const refusedParsed = parseToolResult(refused as never);
-      expect(refusedParsed.isError).toBe(true);
-      expect(refusedParsed.body.code).toBe("AWAITING_APPROVAL");
+      // Give the server time to consume, see AWAITING_APPROVAL, and enter its
+      // wait loop before the human decision lands.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await write.rejectPlan(body.plan_token as string, "reviewer said no");
+
+      const exec = await execPromise;
+      const execParsed = parseToolResult(exec as never);
+      expect(execParsed.isError).toBe(true);
+      expect(execParsed.body.code).toBe("PLAN_REJECTED");
     });
 
     it("run_migration: always requires approval, regardless of affected rows (always 0 for DDL) or the configured threshold", async () => {
@@ -294,11 +302,21 @@ describe("Safety-case integration matrix (#11)", () => {
       expect(body.affected_rows).toBe(0);
       expect(body.status).toBe("awaiting_approval");
 
-      const refused = await client.callTool({
+      // execute_plan BLOCKS while the plan awaits approval; the rejection
+      // landing on the in-flight call surfaces as PLAN_REJECTED and the
+      // migration never runs.
+      const execPromise = client.callTool({
         name: "execute_plan",
         arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
       });
-      expect(parseToolResult(refused as never).body.code).toBe("AWAITING_APPROVAL");
+      // Give the server time to consume, see AWAITING_APPROVAL, and enter its
+      // wait loop before the human decision lands.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await write.rejectPlan(body.plan_token as string, "too risky");
+
+      const exec = await execPromise;
+      expect(parseToolResult(exec as never).body.code).toBe("PLAN_REJECTED");
+      expect(await tableExists(table)).toBe(false);
     });
   });
 
@@ -754,10 +772,6 @@ describe("Safety-case integration matrix (#11)", () => {
         const { body } = parseToolResult(preview as never);
         expect(body.status).toBe("awaiting_approval");
 
-        await client.callTool({
-          name: "execute_plan",
-          arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
-        });
         await write.approvePlan(body.plan_token as string, "reviewer@example.com");
         await client.callTool({
           name: "execute_plan",
@@ -767,15 +781,13 @@ describe("Safety-case integration matrix (#11)", () => {
         const rows = await auditRowsForReason(reason);
         expect(rows.map((r) => r.status)).toEqual([
           "awaiting_approval",
-          "failed",
           "approved",
           "executed",
         ]);
         expect(rows[0].tool).toBe(tool);
-        expect(rows[1].tool).toBe(tool);
-        expect(rows[2].tool).toBe("approve_plan");
-        expect(rows[2].approved_by).toBe("reviewer@example.com");
-        expect(rows[3].tool).toBe(tool);
+        expect(rows[1].tool).toBe("approve_plan");
+        expect(rows[1].approved_by).toBe("reviewer@example.com");
+        expect(rows[2].tool).toBe(tool);
       },
     );
 
@@ -816,10 +828,6 @@ describe("Safety-case integration matrix (#11)", () => {
         arguments: { statement: `CREATE TABLE public.${table} (id serial primary key)`, reason },
       });
       const { body } = parseToolResult(preview as never);
-      await client.callTool({
-        name: "execute_plan",
-        arguments: { plan_token: body.plan_token, statement: body.statement, params: body.params },
-      });
       await write.approvePlan(body.plan_token as string, "reviewer@example.com");
       await client.callTool({
         name: "execute_plan",
@@ -829,13 +837,13 @@ describe("Safety-case integration matrix (#11)", () => {
       const rows = await auditRowsForReason(reason);
       expect(rows.map((r) => r.status)).toEqual([
         "awaiting_approval",
-        "failed",
         "approved",
         "executed",
       ]);
       expect(rows[0].tool).toBe("run_migration");
-      expect(rows[2].tool).toBe("approve_plan");
-      expect(rows[3].tool).toBe("run_migration");
+      expect(rows[1].tool).toBe("approve_plan");
+      expect(rows[1].approved_by).toBe("reviewer@example.com");
+      expect(rows[2].tool).toBe("run_migration");
     });
 
     it("run_migration: a rejected plan is audited as rejected, and a follow-up execute attempt as failed", async () => {

@@ -327,8 +327,13 @@ describe("run_migration (#9)", () => {
     const { plans } = (await resp.json()) as { plans: Array<Record<string, unknown>> };
     const mine = plans.find((p) => p.plan_token === body.plan_token);
     expect(mine).toBeDefined();
-    expect(mine!.statement).toBe(statement);
-    expect(mine!.target).toBe(`public.${table}`);
+    // The core's generalized /api/plans shape nests the SQL payload and the
+    // host-rendered card (renderPlan details) instead of flattening them.
+    const payload = mine!.payload as { statement: string; params: unknown[] };
+    expect(payload.statement).toBe(statement);
+    const render = mine!.render as { title: string; details: Array<{ label: string; value: string }> };
+    const targetDetail = render.details.find((d) => d.label === "Target");
+    expect(targetDetail?.value).toBe(`public.${table}`);
     expect(mine!.reason).toBe(reason);
     expect(mine!.tool).toBe("run_migration");
 

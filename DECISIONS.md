@@ -5,6 +5,85 @@ were, what we picked, and the reasoning a reviewer can check. Newest first.
 
 ---
 
+## 2026-08-13 — Consuming safe-write-mcp-core (#26): the token lifecycle and the approval HTTP server now live in the shared package
+
+**Ticket:** #26 — prove the extracted core generalizes by having this server consume
+it. `src/writeCore.ts`'s `TokenStore` and the localhost approval HTTP server were the
+core's two sources; both are now imported from `safe-write-mcp-core@0.1.0` instead of
+duplicated here, and the deleted code stays deleted.
+
+### What moved to the core, and what stays here
+
+The core owns the plan lifecycle once a plan exists: single-use tokens, expiry,
+payload-fingerprint binding (`consume()` refuses a changed statement/params), the
+approval gate, rejection tombstones, and the deliberate `consume()` check ordering
+(rejected → used → expired → mismatch → awaiting approval). Its `createApprovalServer`/
+`startApprovalServer` own the whole HTTP surface this repo's #7 server had — the
+loopback-only bind, the Host/Origin/Sec-Fetch-Site provenance gates, the
+`Content-Type: application/json` gate, the 64 KiB body cap, and the plan-card page.
+
+What stays here is everything Postgres-shaped: the preview/execute seam (the
+`RETURNING`-wrapped count/sample/digest SQL, the DDL branch, statement timeouts), the
+`ROWSET_CHANGED` digest re-check at execute time, the `approvalRequiredAboveRows`/
+`hardMaxRows` policy, the `mcp_audit.log` persistence, and the agent-facing error
+vocabulary. `TwoPhaseWrite` is now the host adapter the core's README describes: it
+calls `store.create()` after its rolled-back preview and `store.consume()` before its
+committed execute, and re-verifies its own invariant (the row-set digest) in between.
+
+### Error codes: translated at the MCP boundary, native on the HTTP surface
+
+The core speaks generalized lifecycle codes (`PLAN_EXPIRED`, `PLAN_USED`,
+`PLAN_MISMATCH`); this server's agent-facing tools historically speak
+`EXPIRED_TOKEN`/`USED_TOKEN`/`STATEMENT_MISMATCH`. The MCP tool surface keeps its
+historical vocabulary — it is the documented, tested contract agents see — via a
+code-for-code translation of `PlanError` at the `TwoPhaseWrite` boundary. The approval
+HTTP surface, now owned by the core, reports the core's native codes: an expired plan
+refused by `POST /api/plans/:token/approve` is `410` with `code: "PLAN_EXPIRED"`
+(previously `EXPIRED_TOKEN`). The status codes and the behavior are unchanged; only the
+string on the human-facing surface moved to the shared vocabulary. Tests follow.
+
+### The core's AuditSink is deliberately `NoopSink` here
+
+The core emits lifecycle events (`previewed`/`approved`/`executed`/…) to an injectable
+synchronous, never-throwing `AuditSink`. This server's audit rows are richer than that
+event shape — statement, redacted params, preview/actual row counts, `approved_by` —
+and are written by `TwoPhaseWrite` itself at exactly the points the pre-core code wrote
+them. Wiring the core's sink to `mcp_audit.log` as well would double every row and
+corrupt the per-plan status sequences operators (and the test suite) query. One writer
+per row, host-side; the core's sink stays `NoopSink`.
+
+### Bridging audit attribution across the `onDecision` seam
+
+The core's approval server reports every human decision through an `onDecision` hook
+carrying the action, actor, and outcome — but not the plan's metadata, which this
+repo's `approved`/`rejected`/failed-decision audit rows need for full attribution
+(tool, reason, caller, preview row count). The bridge is `PostgresPlanStore`, a thin
+`PlanStore` subclass that captures each `approve()`/`reject()` result (metadata
+included) in a single slot `TwoPhaseWrite.recordApprovalDecision` reads when the hook
+fires. A single slot is safe because the core's handler runs the store transition and
+the hook in one uninterrupted synchronous segment, so two decisions cannot interleave
+between a capture and its read. The upshot: a human decision writes exactly the same
+audit row whether it arrives through the HTTP surface or through
+`approvePlan()`/`rejectPlan()` called directly.
+
+### Surface changes the extraction brought (and tests that follow them)
+
+- `GET /api/plans` JSON: the core's generalized shape — `plan_token`, `tool`, `reason`,
+  `preview_count`, `expires_at`, `caller_id`, `payload` (the host's
+  `{ statement, params }`), and `render` (the host-rendered card) — replaces the old
+  flattened `statement`/`params`/`affected_rows`/`sample_rows`/`target`. The sample
+  rows and DDL target are still shown to the human — the host's `renderPlan` hook
+  renders them as card details, on the page and in the JSON's `render` field.
+- The plan-card badge reads `N affected` (core) instead of `N row(s)` (old local page).
+- `TwoPhaseWrite.listPendingPlans()` and the local `PendingPlan` shape are deleted;
+  the approval server reads `store.listPending()` directly.
+- `statementFingerprint(statement, params)` remains exported (tests and tooling use
+  it) and keeps its whitespace-trim tolerance, now delegating to the core's
+  canonical-JSON `fingerprint()` over the identical `{ statement, params }` payload the
+  plan token is bound to.
+
+---
+
 ## 2026-08-13 — run_migration (#9): forcing approval without a threshold, DDL through a core built for RETURNING, and what "allowlist" means for a table that doesn't exist yet
 
 **Ticket:** #9 — `run_migration`, a DDL tool that reuses `TwoPhaseWrite` (built for #4,

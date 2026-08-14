@@ -171,11 +171,19 @@ describe("localhost approval UI (#7)", () => {
     const { plans } = (await resp.json()) as { plans: Array<Record<string, unknown>> };
     const mine = plans.find((p) => p.plan_token === body.plan_token);
     expect(mine).toBeDefined();
-    expect(mine!.statement).toBe(body.statement);
+    // The core's generalized plan JSON nests the host payload and carries the
+    // host-rendered card fields under `render` (see safe-write-mcp-core's
+    // approval server): statement/params under `payload`, the exact count as
+    // `preview_count`, and the sample rows as a renderPlan detail.
+    const payload = mine!.payload as { statement: string; params: unknown[] };
+    expect(payload.statement).toBe(body.statement);
     expect(mine!.reason).toBe(reason);
-    expect(mine!.affected_rows).toBe(5);
-    expect(mine!.sample_rows).toHaveLength(5);
-    expect(mine!.sample_rows).toEqual(body.sample_rows);
+    expect(mine!.preview_count).toBe(5);
+    const render = mine!.render as { title: string; details: Array<{ label: string; value: string }> };
+    const sample = render.details.find((d) => d.label.startsWith("Sample of affected rows"));
+    expect(sample).toBeDefined();
+    expect(JSON.parse(sample!.value)).toHaveLength(5);
+    expect(JSON.parse(sample!.value)).toEqual(body.sample_rows);
 
     // The same page (server-rendered HTML) also reflects it, without needing
     // any client-side JS to see the statement and reason.
@@ -183,7 +191,7 @@ describe("localhost approval UI (#7)", () => {
     expect(pageResp.status).toBe(200);
     const html = await pageResp.text();
     expect(html).toContain(reason);
-    expect(html).toContain("5 rows");
+    expect(html).toContain("5 affected");
   });
 
   it("AC2 + AC5: approving via the HTTP endpoint unlocks execute_plan and writes an approved audit row", async () => {
@@ -398,7 +406,9 @@ describe("localhost approval UI: expired plans (#7)", () => {
     );
     expect(approveResp.status).toBe(410);
     const approveJson = (await approveResp.json()) as { code: string };
-    expect(approveJson.code).toBe("EXPIRED_TOKEN");
+    // The HTTP surface reports the core's generalized plan-lifecycle codes;
+    // the agent-facing MCP tool surface still maps this to EXPIRED_TOKEN.
+    expect(approveJson.code).toBe("PLAN_EXPIRED");
   });
 });
 

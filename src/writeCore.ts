@@ -1,5 +1,14 @@
-import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
+import {
+  PlanStore,
+  PlanError,
+  fingerprint,
+  NoopSink,
+  type ApprovalDecision,
+  type ApproveResult,
+  type PlanMeta,
+  type RejectResult,
+} from "safe-write-mcp-core";
 import { AuditLog } from "./auditLog.js";
 
 export type WriteErrorCode =
@@ -27,6 +36,25 @@ export class WriteError extends Error {
     this.code = code;
     this.hint = hint;
   }
+}
+
+/**
+ * The agent-facing MCP tool surface keeps this server's historical error
+ * vocabulary; the core's generalized PlanError codes are translated at the
+ * boundary. The two vocabularies describe the same lifecycle events.
+ */
+const CODE_MAP: Record<string, WriteErrorCode> = {
+  UNKNOWN_TOKEN: "UNKNOWN_TOKEN",
+  PLAN_EXPIRED: "EXPIRED_TOKEN",
+  PLAN_USED: "USED_TOKEN",
+  PLAN_MISMATCH: "STATEMENT_MISMATCH",
+  AWAITING_APPROVAL: "AWAITING_APPROVAL",
+  PLAN_REJECTED: "PLAN_REJECTED",
+};
+
+function mapPlanError(err: PlanError): WriteError {
+  const code = CODE_MAP[err.code] ?? "INVALID_INPUT";
+  return new WriteError(code, err.message, err.hint);
 }
 
 export interface WritePreview {
@@ -59,27 +87,6 @@ export interface WritePreview {
 
 export interface ExecuteResult {
   affectedRows: number;
-}
-
-/**
- * One awaiting_approval plan, shaped for a human approval surface (ticket
- * #7's localhost UI): everything it needs to render a card — the exact
- * statement, the agent's stated reason, the exact preview row count, and the
- * sample rows from the preview — without giving it a raw `TokenEntry`.
- * Returned by `TwoPhaseWrite.listPendingPlans()`.
- */
-export interface PendingPlan {
-  planToken: string;
-  tool: string;
-  reason: string | null;
-  statement: string;
-  params: readonly unknown[];
-  previewRows: number;
-  sampleRows: unknown[];
-  expiresAt: number;
-  callerId: string;
-  /** See WritePreview.target. null for every tool except run_migration. */
-  target: string | null;
 }
 
 export interface TwoPhaseWriteOptions {
@@ -131,372 +138,51 @@ export interface WriteMeta {
 
 const DEFAULT_WRITE_META: WriteMeta = { tool: "unknown_tool" };
 
-interface TokenMeta {
-  tool: string;
-  reason: string | null;
-  callerId: string;
-  previewRows: number;
-  target: string | null;
-}
-
-interface TokenEntry extends TokenMeta {
-  fingerprint: string;
-  rowsDigest: string;
-  expiresAt: number;
-  used: boolean;
-  /** True when previewRows exceeded approvalRequiredAboveRows at preview time. */
-  requiresApproval: boolean;
-  /** Always true when !requiresApproval; flipped by TokenStore.approve() otherwise. */
-  approved: boolean;
-  /**
-   * True once TokenStore.reject() has been called. A permanent tombstone:
-   * once set, this entry is never deleted by prune()'s expiry sweep, never
-   * approvable, and consume()/approve() report PLAN_REJECTED for it ahead of
-   * every other check (used, expired, fingerprint), regardless of how much
-   * later execute_plan or approvePlan is called against it.
-   */
-  rejected: boolean;
-  /** Human-supplied rejection reason, surfaced back to the agent's next execute_plan attempt. */
-  rejectionReason: string | null;
-  /** The exact statement/params/sample rows from the preview — kept so listPending() can render a full card without re-running the preview. */
+/**
+ * The preview payload a plan token is bound to: the exact statement + params
+ * the preview ran. The core fingerprints this payload and refuses an
+ * execute whose payload no longer matches (PLAN_MISMATCH, surfaced to the
+ * agent as STATEMENT_MISMATCH).
+ */
+export interface SqlPayload {
   statement: string;
   params: readonly unknown[];
-  sampleRows: unknown[];
+}
+
+function payloadFor(statement: string, params: readonly unknown[]): SqlPayload {
+  // Trimmed so an agent echoing the preview response back with stray
+  // surrounding whitespace still matches — the same tolerance the pre-core
+  // statementFingerprint provided.
+  return { statement: statement.trim(), params };
 }
 
 /**
- * Fingerprint of a statement plus its parameter values. The token is bound to
- * this hash, so `execute_plan` can refuse a changed statement or different
- * params without trusting the agent's claim that it is the same statement.
+ * The core's PlanStore plus a capture of the last approve()/reject()
+ * outcome. The core's approval HTTP server reports every decision through an
+ * `onDecision` hook that carries the action, actor, and outcome — but not
+ * the plan's metadata — and this server's audit rows need that metadata
+ * (tool, reason, caller, preview row count) for full attribution. The
+ * capture below is what bridges the two: `TwoPhaseWrite.recordApprovalDecision`
+ * reads it when the hook fires. A single slot is safe because the core's
+ * request handler calls approve()/reject() and the hook within one
+ * uninterrupted synchronous segment, so two decisions cannot interleave
+ * between a capture and its read.
  */
-export function statementFingerprint(
-  statement: string,
-  params: readonly unknown[],
-): string {
-  const canonical = statement.trim();
-  const paramJson = JSON.stringify(params);
-  return createHash("sha256")
-    .update(canonical)
-    .update("\u0000")
-    .update(paramJson)
-    .digest("hex");
-}
+class PostgresPlanStore extends PlanStore<SqlPayload> {
+  lastDecision: { planToken: string; meta: PlanMeta | null; startedAt: number } | null = null;
 
-type ConsumeResult =
-  | { ok: true; rowsDigest: string; meta: TokenMeta }
-  | { ok: false; error: WriteError; meta?: TokenMeta };
-
-type ApproveResult =
-  | { ok: true; alreadyApproved: boolean; meta: TokenMeta }
-  | { ok: false; error: WriteError; meta?: TokenMeta };
-
-type RejectResult =
-  | { ok: true; alreadyRejected: boolean; meta: TokenMeta }
-  | { ok: false; error: WriteError; meta?: TokenMeta };
-
-/** The exact statement/params/sample rows a preview produced, kept on the token so a human approval surface can render them later without re-running the preview. */
-interface PlanData {
-  statement: string;
-  params: readonly unknown[];
-  sampleRows: unknown[];
-}
-
-class TokenStore {
-  private tokens = new Map<string, TokenEntry>();
-
-  constructor(private ttlMs: number) {}
-
-  create(
-    fingerprint: string,
-    rowsDigest: string,
-    meta: TokenMeta,
-    requiresApproval: boolean,
-    planData: PlanData,
-  ): string {
-    this.prune();
-    const token = randomBytes(24).toString("hex");
-    this.tokens.set(token, {
-      fingerprint,
-      rowsDigest,
-      expiresAt: Date.now() + this.ttlMs,
-      used: false,
-      requiresApproval,
-      approved: !requiresApproval,
-      rejected: false,
-      rejectionReason: null,
-      statement: planData.statement,
-      params: planData.params,
-      sampleRows: planData.sampleRows,
-      ...meta,
-    });
-    return token;
+  override approve(planToken: string): ApproveResult {
+    const startedAt = Date.now();
+    const result = super.approve(planToken);
+    this.lastDecision = { planToken, meta: result.meta, startedAt };
+    return result;
   }
 
-  /**
-   * Plans still awaiting a human decision: requiresApproval, not yet
-   * approved, not used, not rejected, and not expired. Expired entries are
-   * deliberately omitted rather than flagged stale — ticket #7's acceptance
-   * criteria calls for an expired plan to disappear from the pending list,
-   * not sit there approvable.
-   */
-  listPending(): PendingPlan[] {
-    const now = Date.now();
-    const out: PendingPlan[] = [];
-    for (const [token, entry] of this.tokens) {
-      if (!entry.requiresApproval) continue;
-      if (entry.approved || entry.used || entry.rejected) continue;
-      if (now > entry.expiresAt) continue;
-      out.push({
-        planToken: token,
-        tool: entry.tool,
-        reason: entry.reason,
-        statement: entry.statement,
-        params: entry.params,
-        previewRows: entry.previewRows,
-        sampleRows: entry.sampleRows,
-        expiresAt: entry.expiresAt,
-        callerId: entry.callerId,
-        target: entry.target,
-      });
-    }
-    // Soonest-expiring first — the plans a human needs to act on most urgently lead the list.
-    out.sort((a, b) => a.expiresAt - b.expiresAt);
-    return out;
-  }
-
-  /**
-   * Marks a plan token approved so a subsequent `consume()` (via
-   * `TwoPhaseWrite.execute`) no longer refuses it with `AWAITING_APPROVAL`.
-   * Does not consume the token — execute_plan still runs its own statement,
-   * fingerprint, expiry, and rowset checks afterward.
-   */
-  approve(token: string): ApproveResult {
-    const entry = this.tokens.get(token);
-    const meta: TokenMeta | undefined = entry
-      ? {
-          tool: entry.tool,
-          reason: entry.reason,
-          callerId: entry.callerId,
-          previewRows: entry.previewRows,
-          target: entry.target,
-        }
-      : undefined;
-
-    if (!entry) {
-      return {
-        ok: false,
-        error: new WriteError(
-          "UNKNOWN_TOKEN",
-          "No plan matches this token. It may have been revoked or never issued.",
-        ),
-      };
-    }
-    if (entry.rejected) {
-      return {
-        ok: false,
-        error: new WriteError(
-          "PLAN_REJECTED",
-          "This plan was rejected by a human reviewer and cannot be approved.",
-          "A rejected plan cannot be un-rejected. Narrow the statement and re-preview to get a fresh token.",
-        ),
-        meta,
-      };
-    }
-    if (entry.used) {
-      return {
-        ok: false,
-        error: new WriteError(
-          "USED_TOKEN",
-          "This plan token was already used and can no longer be approved.",
-        ),
-        meta,
-      };
-    }
-    if (Date.now() > entry.expiresAt) {
-      this.tokens.delete(token);
-      return {
-        ok: false,
-        error: new WriteError(
-          "EXPIRED_TOKEN",
-          "This plan token has expired. Re-run the write to obtain a fresh preview and token.",
-        ),
-        meta,
-      };
-    }
-    const alreadyApproved = entry.approved;
-    entry.approved = true;
-    return { ok: true, alreadyApproved, meta: meta! };
-  }
-
-  /**
-   * Permanently kills a plan token: it can never be approved or executed
-   * afterward, no matter what is later done to it. Unlike approve()/consume()
-   * this does not delete the entry from the map — it stays as a tombstone
-   * (see the `rejected` field's doc comment) so a later execute_plan or
-   * approvePlan call reports the distinguishable PLAN_REJECTED error instead
-   * of falling through to a generic UNKNOWN_TOKEN once enough time has
-   * passed. Idempotent: rejecting an already-rejected token succeeds again
-   * without changing anything (alreadyRejected: true), so "reject twice" is
-   * harmless rather than an error a human approval UI has to guard against.
-   */
-  reject(token: string, reason: string | null): RejectResult {
-    const entry = this.tokens.get(token);
-    const meta: TokenMeta | undefined = entry
-      ? {
-          tool: entry.tool,
-          reason: entry.reason,
-          callerId: entry.callerId,
-          previewRows: entry.previewRows,
-          target: entry.target,
-        }
-      : undefined;
-
-    if (!entry) {
-      return {
-        ok: false,
-        error: new WriteError(
-          "UNKNOWN_TOKEN",
-          "No plan matches this token. It may have been revoked or never issued.",
-        ),
-      };
-    }
-    if (entry.used) {
-      return {
-        ok: false,
-        error: new WriteError(
-          "USED_TOKEN",
-          "This plan token was already executed and can no longer be rejected.",
-        ),
-        meta,
-      };
-    }
-    // Skip the expiry check once already rejected: an already-dead token
-    // must stay reported as PLAN_REJECTED forever, not flip to EXPIRED_TOKEN
-    // (and get pruned) just because enough wall-clock time passed between
-    // two reject() calls.
-    if (!entry.rejected && Date.now() > entry.expiresAt) {
-      this.tokens.delete(token);
-      return {
-        ok: false,
-        error: new WriteError(
-          "EXPIRED_TOKEN",
-          "This plan token has already expired. There is nothing left to reject.",
-        ),
-        meta,
-      };
-    }
-    const alreadyRejected = entry.rejected;
-    entry.rejected = true;
-    // First reason wins: a second reject() call (or one that omits a reason)
-    // does not overwrite the reason a human already gave.
-    if (!entry.rejectionReason && reason) entry.rejectionReason = reason;
-    return { ok: true, alreadyRejected, meta: meta! };
-  }
-
-  consume(token: string, fingerprint: string): ConsumeResult {
-    const entry = this.tokens.get(token);
-    // Captured before any mutation below, so a failure path can still audit
-    // *what* was being executed (tool, reason, caller) even though the token
-    // itself is about to be deleted or was never valid to begin with.
-    const meta: TokenMeta | undefined = entry
-      ? {
-          tool: entry.tool,
-          reason: entry.reason,
-          callerId: entry.callerId,
-          previewRows: entry.previewRows,
-          target: entry.target,
-        }
-      : undefined;
-
-    if (!entry) {
-      return {
-        ok: false,
-        error: new WriteError(
-          "UNKNOWN_TOKEN",
-          "No plan matches this token. It may have been revoked or never issued.",
-        ),
-      };
-    }
-    // Checked ahead of used/expired/fingerprint: rejection is a permanent
-    // kill, so it must win regardless of what else is true about the token
-    // (including a statement/params that no longer even matches — there is
-    // no scenario in which a rejected token should report anything else).
-    if (entry.rejected) {
-      return {
-        ok: false,
-        error: new WriteError(
-          "PLAN_REJECTED",
-          entry.rejectionReason
-            ? `This plan was rejected by a human reviewer: ${entry.rejectionReason}`
-            : "This plan was rejected by a human reviewer.",
-          "This plan cannot be executed. Narrow the statement (or ask a different question) and call delete_rows again for a fresh preview and token.",
-        ),
-        meta,
-      };
-    }
-    if (entry.used) {
-      this.tokens.delete(token);
-      return {
-        ok: false,
-        error: new WriteError(
-          "USED_TOKEN",
-          "This plan token was already used. A plan token can only be executed once.",
-        ),
-        meta,
-      };
-    }
-    if (Date.now() > entry.expiresAt) {
-      this.tokens.delete(token);
-      return {
-        ok: false,
-        error: new WriteError(
-          "EXPIRED_TOKEN",
-          "This plan token has expired. Re-run the write to obtain a fresh preview and token.",
-        ),
-        meta,
-      };
-    }
-    if (entry.fingerprint !== fingerprint) {
-      return {
-        ok: false,
-        error: new WriteError(
-          "STATEMENT_MISMATCH",
-          "The statement or parameters do not match the plan the token was issued for.",
-          "Pass the exact statement and params from the preview response.",
-        ),
-        meta,
-      };
-    }
-    if (entry.requiresApproval && !entry.approved) {
-      // Deliberately does not delete or mark the token used: it stays
-      // pending so a later TwoPhaseWrite.approvePlan() + execute_plan can
-      // still succeed.
-      return {
-        ok: false,
-        error: new WriteError(
-          "AWAITING_APPROVAL",
-          "This plan affected more rows than the approval threshold allows and has not been approved yet.",
-          "This requires approval through an out-of-band human approval process — it cannot be approved by this agent. Wait for approval, or narrow the statement and re-preview to stay under the threshold.",
-        ),
-        meta,
-      };
-    }
-    entry.used = true;
-    return { ok: true, rowsDigest: entry.rowsDigest, meta: meta! };
-  }
-
-  private prune(): void {
-    const now = Date.now();
-    for (const [token, entry] of this.tokens) {
-      // Rejected entries are deliberately exempt from the expiry sweep —
-      // they are kept as tombstones (see reject()'s doc comment) so a late
-      // execute_plan/approvePlan call still reports PLAN_REJECTED instead of
-      // falling back to UNKNOWN_TOKEN once enough time has passed.
-      if (entry.rejected) continue;
-      if (entry.used || now > entry.expiresAt) {
-        this.tokens.delete(token);
-      }
-    }
+  override reject(planToken: string, reason: string | null): RejectResult {
+    const startedAt = Date.now();
+    const result = super.reject(planToken, reason);
+    this.lastDecision = { planToken, meta: result.meta, startedAt };
+    return result;
   }
 }
 
@@ -511,24 +197,45 @@ class TokenStore {
  * differs, so concurrent inserts/updates cannot cause rows outside the approved
  * preview to be deleted.
  *
+ * The plan-token lifecycle itself (single-use, expiry, fingerprint binding,
+ * approval gating, rejection tombstones) is owned by `safe-write-mcp-core`'s
+ * PlanStore; this class supplies the Postgres-specific halves — the
+ * preview/execute SQL, the ROWSET_CHANGED digest re-check, and the
+ * `mcp_audit.log` rows (the core's AuditSink is deliberately left as
+ * NoopSink: this server writes richer audit rows itself, and double-writing
+ * would corrupt the per-plan status sequences operators query for).
+ *
  * The preview and the execute never share an open transaction: each call
  * checks out its own connection from the pool, so no transaction is left open
  * while the agent is deciding whether to execute.
  */
 export class TwoPhaseWrite {
-  private store: TokenStore;
+  private store: PostgresPlanStore;
   private auditLog: AuditLog;
   private callerId: string;
   private approvalRequiredAboveRows: number;
   private hardMaxRows: number;
 
   constructor(private opts: TwoPhaseWriteOptions) {
-    this.store = new TokenStore(opts.planTtlMs);
+    this.store = new PostgresPlanStore({
+      planTtlMs: opts.planTtlMs,
+      audit: NoopSink,
+    });
     this.auditLog = opts.auditLog ?? new AuditLog(opts.pool);
     this.callerId = opts.callerId ?? "unknown";
     this.approvalRequiredAboveRows =
       opts.approvalRequiredAboveRows ?? DEFAULT_APPROVAL_REQUIRED_ABOVE_ROWS;
     this.hardMaxRows = opts.hardMaxRows ?? DEFAULT_HARD_MAX_ROWS;
+  }
+
+  /**
+   * The core plan store backing this instance. Shared with the localhost
+   * approval server (see src/approvalServer.ts) so an approve/reject there
+   * is visible to `execute` here — plan tokens are in-memory and
+   * process-scoped (see DECISIONS.md).
+   */
+  get planStore(): PlanStore<SqlPayload> {
+    return this.store;
   }
 
   async preview(
@@ -602,24 +309,19 @@ export class TwoPhaseWrite {
         );
       }
 
-      // `alwaysRequireApproval` (run_migration, ticket #9) forces this true
-      // unconditionally — the approvalRequiredAboveRows/hardMaxRows
-      // thresholds above are never consulted for it, on purpose: a DDL
-      // statement affecting zero rows can still be the most destructive
-      // thing this server does, so row count is deliberately not the gate.
-      const requiresApproval =
-        meta.alwaysRequireApproval === true || affectedRows > this.approvalRequiredAboveRows;
-      const status: WritePreview["status"] = requiresApproval
-        ? "awaiting_approval"
-        : "previewed";
-
-      const planToken = this.store.create(
-        statementFingerprint(statement, params),
-        rowsDigest,
-        { tool: meta.tool, reason, callerId: this.callerId, previewRows: affectedRows, target },
-        requiresApproval,
-        { statement, params, sampleRows },
-      );
+      const created = this.store.create(payloadFor(statement, params), {
+        tool: meta.tool,
+        reason,
+        callerId: this.callerId,
+        previewCount: affectedRows,
+        // Kept verbatim (including '' for an empty row set): execute()
+        // re-compares it, and an empty preview digest must still trip
+        // ROWSET_CHANGED if rows enter the predicate before execution.
+        dataDigest: rowsDigest,
+        approvalRequired: affectedRows > this.approvalRequiredAboveRows,
+        alwaysRequireApproval: meta.alwaysRequireApproval,
+        extra: { target, sampleRows },
+      });
 
       // Recorded on the same connection, after ROLLBACK has ended the preview
       // transaction, so the audit row survives the rollback that undoes the
@@ -632,16 +334,24 @@ export class TwoPhaseWrite {
           params,
           previewRows: affectedRows,
           actualRows: null,
-          planToken,
+          planToken: created.planToken,
           approvedBy: null,
-          status,
+          status: created.status,
           durationMs: Date.now() - startedAt,
           callerId: this.callerId,
         },
         client,
       );
 
-      return { planToken, affectedRows, sampleRows, statement, params, status, target };
+      return {
+        planToken: created.planToken,
+        affectedRows,
+        sampleRows,
+        statement,
+        params,
+        status: created.status,
+        target,
+      };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       // HARD_MAX_ROWS_EXCEEDED is thrown deliberately above, after already
@@ -680,14 +390,18 @@ export class TwoPhaseWrite {
     params: readonly unknown[],
   ): Promise<ExecuteResult> {
     const startedAt = Date.now();
-    const fingerprint = statementFingerprint(statement, params);
-    const consumed = this.store.consume(planToken, fingerprint);
+    const consumed = this.store.consume(planToken, payloadFor(statement, params));
     // A token that never existed (or expired before this call) has no stored
     // meta to recover — fall back to generic attribution so the attempt is
     // still audited rather than dropped.
-    const meta: TokenMeta =
-      consumed.meta ??
-      { tool: "execute_plan", reason: null, callerId: this.callerId, previewRows: NaN, target: null };
+    const meta = consumed.meta
+      ? {
+          tool: consumed.meta.tool,
+          reason: consumed.meta.reason,
+          callerId: consumed.meta.callerId,
+          previewRows: consumed.meta.previewCount ?? NaN,
+        }
+      : { tool: "execute_plan", reason: null, callerId: this.callerId, previewRows: NaN };
     const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
 
     if (!consumed.ok) {
@@ -704,9 +418,10 @@ export class TwoPhaseWrite {
         durationMs: Date.now() - startedAt,
         callerId: meta.callerId,
       });
-      throw consumed.error;
+      throw mapPlanError(consumed.error);
     }
 
+    const dataDigest = consumed.meta.dataDigest;
     const client = await this.opts.pool.connect();
     try {
       await client.query(`SET statement_timeout = ${this.opts.statementTimeoutMs}`);
@@ -721,7 +436,7 @@ export class TwoPhaseWrite {
         // ROWSET_CHANGED check exists to catch "the matched row set changed
         // between preview and execute" for DELETE/UPDATE's WHERE-matched
         // rows; DDL has no such matched row set for the same reason INSERT
-        // doesn't (see the comment below) — statementFingerprint (exact
+        // doesn't (see the comment below) — the payload fingerprint (exact
         // statement + params) plus the token's single-use/expiry/approval
         // guarantees are what apply here instead. See DECISIONS.md.
         await client.query(statement, params as unknown[]);
@@ -743,10 +458,10 @@ export class TwoPhaseWrite {
         // about. Comparing digests for INSERT would make ROWSET_CHANGED fire
         // on effectively every insert into a table with a server-generated
         // default, which is not the concurrent-modification signal this check
-        // exists to catch — statementFingerprint (exact statement + params)
-        // already guarantees execute() replays the identical INSERT the agent
-        // previewed, which is the only guarantee that applies here.
-        if (!isInsertStatement(statement) && row.rows_digest !== consumed.rowsDigest) {
+        // exists to catch — the payload fingerprint (exact statement +
+        // params) already guarantees execute() replays the identical INSERT
+        // the agent previewed, which is the only guarantee that applies here.
+        if (!isInsertStatement(statement) && dataDigest !== null && row.rows_digest !== dataDigest) {
           throw new WriteError(
             "ROWSET_CHANGED",
             "The set of rows the statement would affect changed since the preview.",
@@ -809,10 +524,10 @@ export class TwoPhaseWrite {
    * builds: an internal/programmatic entry point that is deliberately NOT
    * exposed as an MCP tool (see src/server.ts) — the requesting agent must
    * not be able to approve its own gated plan. Ticket #7's localhost human
-   * approval page is expected to call this method directly. There is
-   * deliberately no separate "approvals store" table — the plan token
-   * itself, already the unit `execute_plan` is scoped to, carries the
-   * approval flag; see TokenEntry.approved in this file.
+   * approval page reaches the same store through the core's approval server
+   * (see src/approvalServer.ts). There is deliberately no separate
+   * "approvals store" table — the plan token itself, already the unit
+   * `execute_plan` is scoped to, carries the approval flag.
    *
    * Idempotent: approving an already-approved (or never-gated) token
    * succeeds without error. Does not consume the token or touch the
@@ -822,52 +537,19 @@ export class TwoPhaseWrite {
   async approvePlan(planToken: string, approvedBy: string | null = null): Promise<void> {
     const startedAt = Date.now();
     const result = this.store.approve(planToken);
-    const meta: TokenMeta =
-      result.meta ??
-      { tool: "approve_plan", reason: null, callerId: this.callerId, previewRows: NaN, target: null };
-    const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
-
-    if (!result.ok) {
-      await this.auditLog.record({
-        tool: meta.tool,
-        reason: meta.reason,
-        statement: "",
-        params: [],
-        previewRows,
-        actualRows: null,
-        planToken,
-        approvedBy,
-        status: "failed",
-        durationMs: Date.now() - startedAt,
-        callerId: meta.callerId,
-      });
-      throw result.error;
-    }
-
-    await this.auditLog.record({
-      tool: "approve_plan",
-      reason: meta.reason,
-      statement: "",
-      params: [],
-      previewRows,
-      actualRows: null,
-      planToken,
-      approvedBy: approvedBy ?? "unknown",
-      status: "approved",
-      durationMs: Date.now() - startedAt,
-      callerId: meta.callerId,
-    });
+    await this.auditApprovalOutcome(planToken, approvedBy, result.ok, result.meta, startedAt);
+    if (!result.ok) throw mapPlanError(result.error);
   }
 
   /**
    * Permanently kills a plan token: it can never be approved or executed
-   * afterward, and `execute` reports the distinguishable `PLAN_REJECTED`
-   * error for it (not a generic failure) — see TokenStore.reject()'s doc
-   * comment for why the token stays around as a tombstone rather than being
-   * deleted outright. This is the symmetric counterpart to `approvePlan()`:
-   * ticket #7's localhost approval page calls this directly for its Reject
-   * button, the same (deliberately non-MCP-tool) way it calls `approvePlan`
-   * for Approve.
+   * afterward, no matter what is later done to it. `execute` reports the
+   * distinguishable `PLAN_REJECTED` error for it (not a generic failure) —
+   * the core keeps the token as a tombstone rather than deleting it outright
+   * so the refusal stays distinguishable from UNKNOWN_TOKEN even after
+   * expiry. This is the symmetric counterpart to `approvePlan()`: ticket
+   * #7's localhost approval page reaches the same store through the core's
+   * approval server for its Reject button.
    *
    * `reason` is optional human-readable text (e.g. "too broad, narrow the
    * WHERE clause") that gets folded into the WriteError message the agent's
@@ -888,54 +570,108 @@ export class TwoPhaseWrite {
   ): Promise<void> {
     const startedAt = Date.now();
     const result = this.store.reject(planToken, reason);
-    const meta: TokenMeta =
-      result.meta ??
-      { tool: "reject_plan", reason: null, callerId: this.callerId, previewRows: NaN, target: null };
-    const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
+    await this.auditRejectionOutcome(planToken, rejectedBy, result.ok, result.meta, startedAt);
+    if (!result.ok) throw mapPlanError(result.error);
+  }
 
-    if (!result.ok) {
+  /**
+   * Writes the audit row for one approve/reject decision made through the
+   * core's approval HTTP server, whose `onDecision` hook carries the action,
+   * actor, and outcome but not the plan's metadata. The metadata is
+   * recovered from `PostgresPlanStore.lastDecision`, captured in the same
+   * synchronous segment as the store transition itself (see that class's
+   * doc comment). Produces exactly the rows `approvePlan`/`rejectPlan`
+   * produce for the same outcomes, so the audit trail is identical
+   * regardless of which surface a human decision came through.
+   */
+  async recordApprovalDecision(decision: ApprovalDecision): Promise<void> {
+    const captured = this.store.lastDecision;
+    const matched = captured !== null && captured.planToken === decision.planToken;
+    const meta = matched ? captured.meta : null;
+    const startedAt = matched ? captured.startedAt : Date.now();
+    if (decision.action === "approve") {
+      await this.auditApprovalOutcome(decision.planToken, decision.actor, decision.ok, meta, startedAt);
+    } else {
+      await this.auditRejectionOutcome(decision.planToken, decision.actor, decision.ok, meta, startedAt);
+    }
+  }
+
+  private async auditApprovalOutcome(
+    planToken: string,
+    approvedBy: string | null,
+    ok: boolean,
+    meta: PlanMeta | null,
+    startedAt: number,
+  ): Promise<void> {
+    const view = metaView(meta, "approve_plan", this.callerId);
+    if (!ok) {
       await this.auditLog.record({
-        tool: meta.tool,
-        reason: meta.reason,
+        tool: view.tool,
+        reason: view.reason,
         statement: "",
         params: [],
-        previewRows,
+        previewRows: view.previewRows,
+        actualRows: null,
+        planToken,
+        approvedBy,
+        status: "failed",
+        durationMs: Date.now() - startedAt,
+        callerId: view.callerId,
+      });
+      return;
+    }
+    await this.auditLog.record({
+      tool: "approve_plan",
+      reason: view.reason,
+      statement: "",
+      params: [],
+      previewRows: view.previewRows,
+      actualRows: null,
+      planToken,
+      approvedBy: approvedBy ?? "unknown",
+      status: "approved",
+      durationMs: Date.now() - startedAt,
+      callerId: view.callerId,
+    });
+  }
+
+  private async auditRejectionOutcome(
+    planToken: string,
+    rejectedBy: string | null,
+    ok: boolean,
+    meta: PlanMeta | null,
+    startedAt: number,
+  ): Promise<void> {
+    const view = metaView(meta, "reject_plan", this.callerId);
+    if (!ok) {
+      await this.auditLog.record({
+        tool: view.tool,
+        reason: view.reason,
+        statement: "",
+        params: [],
+        previewRows: view.previewRows,
         actualRows: null,
         planToken,
         approvedBy: rejectedBy,
         status: "failed",
         durationMs: Date.now() - startedAt,
-        callerId: meta.callerId,
+        callerId: view.callerId,
       });
-      throw result.error;
+      return;
     }
-
     await this.auditLog.record({
       tool: "reject_plan",
-      reason: meta.reason,
+      reason: view.reason,
       statement: "",
       params: [],
-      previewRows,
+      previewRows: view.previewRows,
       actualRows: null,
       planToken,
       approvedBy: rejectedBy ?? "unknown",
       status: "rejected",
       durationMs: Date.now() - startedAt,
-      callerId: meta.callerId,
+      callerId: view.callerId,
     });
-  }
-
-  /**
-   * Plans currently awaiting a human decision — requiresApproval, not yet
-   * approved, not used, not rejected, not expired — with the exact
-   * statement, reason, preview row count, and sample rows a human approval
-   * surface (ticket #7) needs to render a card per plan. Deliberately not an
-   * MCP tool: this is read access to the same out-of-band surface
-   * `approvePlan`/`rejectPlan` already are, not something the requesting
-   * agent needs (or should get) a live view of.
-   */
-  listPendingPlans(): PendingPlan[] {
-    return this.store.listPending();
   }
 
   private previewSql(statement: string): string {
@@ -961,6 +697,21 @@ SELECT
 FROM _affected
 `;
   }
+}
+
+/** The plan-meta view audit rows need, with the same fallback attribution the pre-core code used. */
+function metaView(
+  meta: PlanMeta | null,
+  fallbackTool: string,
+  fallbackCallerId: string,
+): { tool: string; reason: string | null; callerId: string; previewRows: number | null } {
+  const previewCount = meta?.previewCount ?? NaN;
+  return {
+    tool: meta?.tool ?? fallbackTool,
+    reason: meta?.reason ?? null,
+    callerId: meta?.callerId ?? fallbackCallerId,
+    previewRows: Number.isNaN(previewCount) ? null : previewCount,
+  };
 }
 
 /**
@@ -1018,4 +769,17 @@ function translateDbError(err: unknown): unknown {
     }
   }
   return err;
+}
+
+/**
+ * Fingerprint of a statement plus its parameter values, via the core's
+ * canonical-JSON fingerprint. Exported for tests and tooling; the plan
+ * binding itself is enforced inside PlanStore.create()/consume() on the
+ * identical payload shape.
+ */
+export function statementFingerprint(
+  statement: string,
+  params: readonly unknown[],
+): string {
+  return fingerprint(payloadFor(statement, params));
 }

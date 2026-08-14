@@ -6,6 +6,7 @@ import {
   NoopSink,
   type ApprovalDecision,
   type ApproveResult,
+  type PlanErrorCode,
   type PlanMeta,
   type RejectResult,
 } from "safe-write-mcp-core";
@@ -41,9 +42,11 @@ export class WriteError extends Error {
 /**
  * The agent-facing MCP tool surface keeps this server's historical error
  * vocabulary; the core's generalized PlanError codes are translated at the
- * boundary. The two vocabularies describe the same lifecycle events.
+ * boundary. The two vocabularies describe the same lifecycle events. Keyed
+ * by PlanErrorCode so adding a code to the core forces a mapping decision
+ * here at compile time.
  */
-const CODE_MAP: Record<string, WriteErrorCode> = {
+const CODE_MAP: Record<PlanErrorCode, WriteErrorCode> = {
   UNKNOWN_TOKEN: "UNKNOWN_TOKEN",
   PLAN_EXPIRED: "EXPIRED_TOKEN",
   PLAN_USED: "USED_TOKEN",
@@ -53,7 +56,7 @@ const CODE_MAP: Record<string, WriteErrorCode> = {
 };
 
 function mapPlanError(err: PlanError): WriteError {
-  const code = CODE_MAP[err.code] ?? "INVALID_INPUT";
+  const code = CODE_MAP[err.code];
   return new WriteError(code, err.message, err.hint);
 }
 

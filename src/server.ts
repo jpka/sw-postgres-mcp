@@ -210,6 +210,7 @@ export function createServer(
     approvalRequiredAboveRows: config.write.approvalRequiredAboveRows,
     hardMaxRows: config.write.hardMaxRows,
     callerId: config.callerId,
+    approvalAvailable: config.approvalServer?.enabled ?? true,
   }),
 ): Server {
   const server = new Server(

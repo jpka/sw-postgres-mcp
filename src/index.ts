@@ -34,6 +34,7 @@ async function main(): Promise<void> {
     approvalRequiredAboveRows: config.write.approvalRequiredAboveRows,
     hardMaxRows: config.write.hardMaxRows,
     callerId: config.callerId,
+    approvalAvailable: config.approvalServer?.enabled ?? true,
   });
 
   let approvalServer: ApprovalServerHandle | undefined;

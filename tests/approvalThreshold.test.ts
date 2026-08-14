@@ -287,6 +287,45 @@ describe("approval threshold, hard row cap, and awaiting_approval (#6)", () => {
     });
   });
 
+  it("with the approval server disabled (approvalAvailable: false), a gated preview is refused outright instead of issuing an un-approvable plan", async () => {
+    // A deployment that disables the approval server (approvalServer.enabled:
+    // false — see src/index.ts wiring this into TwoPhaseWrite) must not issue
+    // plans that can never be approved: execute_plan would otherwise block on
+    // them until the token expires. Same wall-not-gate shape as the hard cap.
+    const noApproval = new TwoPhaseWrite({
+      pool: serverPools.writerPool,
+      planTtlMs: 60_000,
+      statementTimeoutMs: 10_000,
+      approvalRequiredAboveRows: APPROVAL_REQUIRED_ABOVE_ROWS,
+      hardMaxRows: HARD_MAX_ROWS,
+      callerId: "no-approval-test",
+      approvalAvailable: false,
+    });
+
+    // 5 rows > 3-row threshold: would normally be awaiting_approval.
+    const reason = `no-approval-gated-${randomUUID()}`;
+    await expect(
+      noApproval.preview(`DELETE FROM ${TABLE} WHERE id <= 5`, [], {
+        tool: "delete_rows",
+        reason,
+      }),
+    ).rejects.toMatchObject({ code: "APPROVAL_UNAVAILABLE" });
+
+    const rows = await auditRowsForReason(reason);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe("failed");
+    expect(rows[0].plan_token).toBeNull();
+
+    // Below the threshold there is nothing to approve: previews still work
+    // exactly as normal, proving the wall only stops gated plans.
+    const below = await noApproval.preview(`DELETE FROM ${TABLE} WHERE id <= 2`, [], {
+      tool: "delete_rows",
+      reason: `no-approval-below-${randomUUID()}`,
+    });
+    expect(below.status).toBe("previewed");
+    expect(below.affectedRows).toBe(2);
+  });
+
   it("AC7: both thresholds are independently configurable, not hardcoded", async () => {
     // A second server instance wired with different (still non-default)
     // thresholds behaves differently for the same row counts, proving the

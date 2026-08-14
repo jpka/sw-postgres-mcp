@@ -95,6 +95,8 @@ Copy `config.example.json` to `config.json` (or set `SW_POSTGRES_CONFIG` to a cu
 - `callerId` — identity recorded as `caller_id` on every audit log row (default `"unknown"`). Overridable with `SW_CALLER_ID`. See [Audit log](#audit-log).
 - Environment variables `DATABASE_URL_READONLY` / `DATABASE_URL_WRITER` override the file.
 
+The config is read **once at server startup** — a running server never re-reads `config.json`. After editing it, restart the MCP server (quit and reopen Claude Desktop / your MCP client), or the old config keeps being enforced. On startup the server logs to stderr which config file it loaded and the effective write allowlist; if no config file is found it warns loudly, because a missing file means an empty write allowlist (default deny — every write refused).
+
 Two connection pools are created with distinct Postgres roles (`readonly` vs `writer`). Read-only is enforced by the database grants, not by parsing SQL — a bug in our code cannot turn a read tool into a write tool.
 
 ## Claude Desktop
@@ -108,6 +110,7 @@ Add to `claude_desktop_config.json`:
       "command": "node",
       "args": ["/absolute/path/to/sw-postgres-mcp/dist/index.js"],
       "env": {
+        "SW_POSTGRES_CONFIG": "/absolute/path/to/sw-postgres-mcp/config.json",
         "DATABASE_URL_READONLY": "postgres://readonly:readonly_password@localhost:5432/mcp_test",
         "DATABASE_URL_WRITER": "postgres://writer:writer_password@localhost:5432/mcp_test"
       }
@@ -115,6 +118,8 @@ Add to `claude_desktop_config.json`:
   }
 }
 ```
+
+`SW_POSTGRES_CONFIG` is set explicitly because MCP clients do not spawn the server with the project directory as the working directory, so the default `./config.json` lookup would silently miss it.
 
 Restart Claude Desktop. Ask "what's in this database?" — `describe_schema` returns tables, columns with types, foreign keys, and row-count estimates for exactly the allowlisted schemas/tables.
 

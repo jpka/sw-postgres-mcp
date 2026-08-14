@@ -147,11 +147,12 @@ export function isTableWritable(
 }
 
 export function loadConfig(configPath?: string): AppConfig {
-  const envPath = process.env.SW_POSTGRES_CONFIG;
+  const envPath = process.env.SW_POSTGRES_CONFIG || undefined;
   const resolvedPath = configPath ?? envPath ?? resolve(process.cwd(), "config.json");
 
   let raw: unknown = {};
-  if (existsSync(resolvedPath)) {
+  const configFileFound = existsSync(resolvedPath);
+  if (configFileFound) {
     const content = readFileSync(resolvedPath, "utf-8");
     raw = JSON.parse(content) as unknown;
   }
@@ -272,6 +273,22 @@ export function loadConfig(configPath?: string): AppConfig {
       },
     };
   }
+
+  // Log which config the server actually loaded (stderr only — stdout is the
+  // MCP channel). A missing file previously failed silently: env-provided
+  // connection strings kept the server looking healthy while the empty write
+  // allowlist refused every write, leaving no trace of why.
+  if (!configFileFound) {
+    console.error(
+      `[sw-postgres-mcp] WARNING: no config file found at ${resolvedPath} — running on ` +
+        `defaults/env only. The write allowlist is EMPTY (default deny): every write will ` +
+        `be refused. Set SW_POSTGRES_CONFIG or start the server from the directory containing config.json.`,
+    );
+  }
+  console.error(
+    `[sw-postgres-mcp] config ${configFileFound ? `loaded from ${resolvedPath}` : "NOT loaded (see warning above)"}; ` +
+      `write allowlist: schemas=${JSON.stringify(allowlist.write.schemas ?? [])} tables=${JSON.stringify(allowlist.write.tables ?? [])}`,
+  );
 
   const database: DatabaseConfig = {
     readonlyConnectionString:

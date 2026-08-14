@@ -61,6 +61,28 @@ async function auditRowsForReason(reason: string): Promise<Record<string, unknow
 }
 
 /**
+ * Waits for an HTTP-driven approve/reject decision's audit row to land. The
+ * core approval server sends its HTTP response before awaiting the `onDecision`
+ * audit hook, so the audit write for the *last* decision can still be in
+ * flight when this test's next assertion runs. Polls (bounded) until
+ * `expectedCount` rows exist, then returns them; rows are keyed by monotonic
+ * `id`, so the sequence is final once the count is reached.
+ */
+async function waitForAuditRows(
+  reason: string,
+  expectedCount: number,
+  timeoutMs = 5_000,
+): Promise<Record<string, unknown>[]> {
+  const deadline = Date.now() + timeoutMs;
+  let rows = await auditRowsForReason(reason);
+  while (rows.length < expectedCount && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    rows = await auditRowsForReason(reason);
+  }
+  return rows;
+}
+
+/**
  * Sends a raw HTTP request with full control over headers — including ones
  * the Fetch spec forbids scripts from setting (`Host` in particular), which
  * is exactly what's needed to exercise the CSRF-hardening request-provenance
@@ -310,7 +332,7 @@ describe("localhost approval UI (#7)", () => {
     expect(secondReject.status).toBe(200);
     expect(((await secondReject.json()) as { ok: boolean }).ok).toBe(true);
 
-    const rows = await auditRowsForReason(reason);
+    const rows = await waitForAuditRows(reason, 6);
     expect(rows.map((r) => r.status)).toEqual([
       "awaiting_approval",
       "rejected",

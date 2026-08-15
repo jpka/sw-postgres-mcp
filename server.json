@@ -7,12 +7,12 @@
     "url": "https://github.com/jpka/sw-postgres-mcp",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "0.3.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "sw-postgres-mcp",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "transport": { "type": "stdio" },
       "environmentVariables": [
         {

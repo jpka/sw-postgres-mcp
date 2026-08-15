@@ -1,6 +1,6 @@
-# sw-postgres-mcp
+# Safe-write Postgres MCP server
 
-Safe-write Postgres MCP server — an agent can read and modify a database without being able to cause an unrecoverable accident. The differentiator is the safety layer, not the tool coverage: 8 MCP tools, 3 of them read-only, 4 write tools that only ever *preview* a change, and one `execute_plan` that commits a previewed change and nothing else.
+An agent can read and modify a database without being able to cause an unrecoverable accident. The differentiator is the safety layer, not the tool coverage: 8 MCP tools, 3 of them read-only, 4 write tools that only ever *preview* a change, and one `execute_plan` that commits a previewed change and nothing else.
 
 ## Architecture
 

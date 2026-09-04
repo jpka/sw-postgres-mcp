@@ -105,6 +105,28 @@ function rawRequest(
   });
 }
 
+/**
+ * 0.4.0: every approval-server route requires the per-session bearer token
+ * (`Authorization: Bearer <token>`, or a `?token=` query-string fallback).
+ * This helper carries it on every request so the tests below exercise the
+ * approval behavior itself; the bearer-token gate itself is covered by the
+ * dedicated "bearer token authentication" block further down. When auth is
+ * disabled (`requireAuth: false`, `token: null`) it degrades to plain fetch.
+ */
+function approvalFetch(
+  approval: ApprovalServerHandle,
+  url: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const token = approval.token;
+  if (token === null) return fetch(url, init);
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Authorization") && !url.includes("token=")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  return fetch(url, { ...init, headers });
+}
+
 describe("localhost approval UI (#7)", () => {
   let client: Client;
   let serverPools: ReturnType<typeof createPools>;
@@ -188,7 +210,7 @@ describe("localhost approval UI (#7)", () => {
     const { body } = parseToolResult(preview as never);
     expect(body.status).toBe("awaiting_approval");
 
-    const resp = await fetch(`${baseUrl}/api/plans`);
+    const resp = await approvalFetch(approval, `${baseUrl}/api/plans`);
     expect(resp.status).toBe(200);
     const { plans } = (await resp.json()) as { plans: Array<Record<string, unknown>> };
     const mine = plans.find((p) => p.plan_token === body.plan_token);
@@ -209,7 +231,7 @@ describe("localhost approval UI (#7)", () => {
 
     // The same page (server-rendered HTML) also reflects it, without needing
     // any client-side JS to see the statement and reason.
-    const pageResp = await fetch(`${baseUrl}/`);
+    const pageResp = await approvalFetch(approval, `${baseUrl}/`);
     expect(pageResp.status).toBe(200);
     const html = await pageResp.text();
     expect(html).toContain(reason);
@@ -235,7 +257,7 @@ describe("localhost approval UI (#7)", () => {
     // wait loop before the human decision lands.
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const approveResp = await fetch(
+    const approveResp = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`,
       {
         method: "POST",
@@ -248,7 +270,7 @@ describe("localhost approval UI (#7)", () => {
     expect(approveJson.ok).toBe(true);
 
     // Approved plan drops off the pending list.
-    const listAfter = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+    const listAfter = (await (await approvalFetch(approval, `${baseUrl}/api/plans`)).json()) as {
       plans: Array<Record<string, unknown>>;
     };
     expect(listAfter.plans.find((p) => p.plan_token === body.plan_token)).toBeUndefined();
@@ -279,7 +301,7 @@ describe("localhost approval UI (#7)", () => {
     const { body } = parseToolResult(preview as never);
     expect(body.status).toBe("awaiting_approval");
 
-    const rejectResp = await fetch(
+    const rejectResp = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/reject`,
       {
         method: "POST",
@@ -306,7 +328,7 @@ describe("localhost approval UI (#7)", () => {
     expect(await countRows()).toBe(20);
 
     // Approving after rejecting does not un-kill it.
-    const approveAfterReject = await fetch(
+    const approveAfterReject = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
     );
@@ -322,7 +344,7 @@ describe("localhost approval UI (#7)", () => {
     expect(parseToolResult(stillExec as never).body.code).toBe("PLAN_REJECTED");
 
     // Rejecting twice is harmless, not an error, and does not change the outcome.
-    const secondReject = await fetch(
+    const secondReject = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/reject`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
     );
@@ -363,7 +385,7 @@ describe("localhost approval UI (#7)", () => {
     // wait loop before the human decision lands.
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const rejectResp = await fetch(
+    const rejectResp = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/reject`,
       {
         method: "POST",
@@ -394,7 +416,7 @@ describe("localhost approval UI (#7)", () => {
   });
 
   it("rejecting a plan the agent never previewed (unknown token) is a structured 404, not a crash", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans/not-a-real-token/reject`, {
+    const resp = await approvalFetch(approval, `${baseUrl}/api/plans/not-a-real-token/reject`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
@@ -414,7 +436,7 @@ describe("localhost approval UI (#7)", () => {
     const { body } = parseToolResult(preview as never);
     expect(body.status).toBe("previewed");
 
-    const { plans } = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+    const { plans } = (await (await approvalFetch(approval, `${baseUrl}/api/plans`)).json()) as {
       plans: Array<Record<string, unknown>>;
     };
     expect(plans.find((p) => p.plan_token === body.plan_token)).toBeUndefined();
@@ -457,19 +479,19 @@ describe("localhost approval UI: expired plans (#7)", () => {
     });
     expect(preview.status).toBe("awaiting_approval");
 
-    const before = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+    const before = (await (await approvalFetch(approval, `${baseUrl}/api/plans`)).json()) as {
       plans: Array<Record<string, unknown>>;
     };
     expect(before.plans.find((p) => p.plan_token === preview.planToken)).toBeDefined();
 
     await new Promise((resolve) => setTimeout(resolve, 200));
 
-    const after = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+    const after = (await (await approvalFetch(approval, `${baseUrl}/api/plans`)).json()) as {
       plans: Array<Record<string, unknown>>;
     };
     expect(after.plans.find((p) => p.plan_token === preview.planToken)).toBeUndefined();
 
-    const approveResp = await fetch(
+    const approveResp = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(preview.planToken)}/approve`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
     );
@@ -507,11 +529,11 @@ describe("localhost approval UI is reachable over plain HTTP without any MCP cli
 
   it("GET / and GET /api/plans succeed with plain fetch(), with no MCP client ever having connected", async () => {
     const baseUrl = `http://${approval.host}:${approval.port}`;
-    const page = await fetch(`${baseUrl}/`);
+    const page = await approvalFetch(approval, `${baseUrl}/`);
     expect(page.status).toBe(200);
     expect(page.headers.get("content-type")).toMatch(/text\/html/);
 
-    const api = await fetch(`${baseUrl}/api/plans`);
+    const api = await approvalFetch(approval, `${baseUrl}/api/plans`);
     expect(api.status).toBe(200);
     const json = (await api.json()) as { plans: unknown[] };
     expect(json.plans).toEqual([]);
@@ -519,7 +541,7 @@ describe("localhost approval UI is reachable over plain HTTP without any MCP cli
 
   it("an unknown route returns a structured 404", async () => {
     const baseUrl = `http://${approval.host}:${approval.port}`;
-    const resp = await fetch(`${baseUrl}/nope`);
+    const resp = await approvalFetch(approval, `${baseUrl}/nope`);
     expect(resp.status).toBe(404);
     const json = (await resp.json()) as { ok: boolean; code: string };
     expect(json.ok).toBe(false);
@@ -559,7 +581,12 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
   it("rejects a request with a Host header that doesn't match the actual bound port", async () => {
     const result = await rawRequest(`${baseUrl}/api/plans`, {
       method: "GET",
-      headers: { Host: "evil.example.com" },
+      // A valid bearer token is included to prove the provenance check runs
+      // before auth: this must be 403 FORBIDDEN, not 401 UNAUTHORIZED.
+      headers: {
+        Host: "evil.example.com",
+        ...(approval.token !== null ? { Authorization: `Bearer ${approval.token}` } : {}),
+      },
     });
     expect(result.status).toBe(403);
     const json = JSON.parse(result.body) as { ok: boolean; code: string };
@@ -568,7 +595,7 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
   });
 
   it("rejects a request with an Origin header that doesn't match this server's origin", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans`, {
+    const resp = await approvalFetch(approval, `${baseUrl}/api/plans`, {
       headers: { Origin: "http://evil.example.com" },
     });
     expect(resp.status).toBe(403);
@@ -578,7 +605,7 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
   });
 
   it("rejects a request with Sec-Fetch-Site: cross-site", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans`, {
+    const resp = await approvalFetch(approval, `${baseUrl}/api/plans`, {
       headers: { "Sec-Fetch-Site": "cross-site" },
     });
     expect(resp.status).toBe(403);
@@ -596,7 +623,7 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
     // A CORS "simple request" Content-Type — this is exactly the shape a
     // cross-origin page could send with fetch() or a <form> POST without the
     // browser ever issuing a preflight request.
-    const resp = await fetch(
+    const resp = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(preview.planToken)}/approve`,
       { method: "POST", headers: { "Content-Type": "text/plain" }, body: "{}" },
     );
@@ -606,7 +633,7 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
     expect(json.code).toBe("UNSUPPORTED_MEDIA_TYPE");
 
     // The plan is untouched — still approvable the legitimate way.
-    const list = (await (await fetch(`${baseUrl}/api/plans`)).json()) as {
+    const list = (await (await approvalFetch(approval, `${baseUrl}/api/plans`)).json()) as {
       plans: Array<Record<string, unknown>>;
     };
     expect(list.plans.find((p) => p.plan_token === preview.planToken)).toBeDefined();
@@ -619,7 +646,16 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
     });
     const result = await rawRequest(
       `${baseUrl}/api/plans/${encodeURIComponent(preview.planToken)}/approve`,
-      { method: "POST", body: "{}" },
+      {
+        method: "POST",
+        // The bearer token must be present: auth is checked before the
+        // Content-Type gate, so without it this would be 401, not 415.
+        // Deliberately no Content-Type — that absence is what this sends.
+        headers: {
+          ...(approval.token !== null ? { Authorization: `Bearer ${approval.token}` } : {}),
+        },
+        body: "{}",
+      },
     );
     expect(result.status).toBe(415);
     const json = JSON.parse(result.body) as { ok: boolean; code: string };
@@ -628,14 +664,14 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
   });
 
   it("still serves legitimate requests: matching Host, no Origin, correct Content-Type", async () => {
-    const getResp = await fetch(`${baseUrl}/api/plans`);
+    const getResp = await approvalFetch(approval, `${baseUrl}/api/plans`);
     expect(getResp.status).toBe(200);
 
     const preview = await write.preview(`DELETE FROM ${TABLE} WHERE id <= 1`, [], {
       tool: "delete_rows",
       reason: `csrf-legit-${randomUUID()}`,
     });
-    const approveResp = await fetch(
+    const approveResp = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(preview.planToken)}/approve`,
       { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
     );
@@ -644,36 +680,36 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
   });
 
   it("still serves a legitimate request whose Origin matches this server's own origin", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans`, {
+    const resp = await approvalFetch(approval, `${baseUrl}/api/plans`, {
       headers: { Origin: baseUrl },
     });
     expect(resp.status).toBe(200);
   });
 
   it("still serves a legitimate request with Sec-Fetch-Site: same-origin", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans`, {
+    const resp = await approvalFetch(approval, `${baseUrl}/api/plans`, {
       headers: { "Sec-Fetch-Site": "same-origin" },
     });
     expect(resp.status).toBe(200);
   });
 
   it("still serves a direct address-bar navigation with Sec-Fetch-Site: none", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans`, {
+    const resp = await approvalFetch(approval, `${baseUrl}/api/plans`, {
       headers: { "Sec-Fetch-Site": "none" },
     });
     expect(resp.status).toBe(200);
   });
 
   it("sets Cache-Control: no-store on both JSON and HTML responses", async () => {
-    const jsonResp = await fetch(`${baseUrl}/api/plans`);
+    const jsonResp = await approvalFetch(approval, `${baseUrl}/api/plans`);
     expect(jsonResp.headers.get("cache-control")).toBe("no-store");
 
-    const htmlResp = await fetch(`${baseUrl}/`);
+    const htmlResp = await approvalFetch(approval, `${baseUrl}/`);
     expect(htmlResp.headers.get("cache-control")).toBe("no-store");
   });
 
   it("returns 404, not 500, for a malformed percent-escape in the plan-token path segment", async () => {
-    const resp = await fetch(`${baseUrl}/api/plans/%E0%A4%A/approve`, {
+    const resp = await approvalFetch(approval, `${baseUrl}/api/plans/%E0%A4%A/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
@@ -682,5 +718,166 @@ describe("localhost approval UI: CSRF / request-provenance hardening", () => {
     const json = (await resp.json()) as { ok: boolean; code: string };
     expect(json.ok).toBe(false);
     expect(json.code).toBe("NOT_FOUND");
+  });
+});
+
+describe("localhost approval UI: bearer token authentication (0.4.0, safe-write-mcp-core#20)", () => {
+  let writerPool: pg.Pool;
+  let write: TwoPhaseWrite;
+  let approval: ApprovalServerHandle;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    await waitForDb(SUPERUSER_URL);
+    await resetTable();
+    writerPool = new pg.Pool({ connectionString: WRITER_URL, max: 2 });
+    write = new TwoPhaseWrite({
+      pool: writerPool,
+      planTtlMs: 60_000,
+      statementTimeoutMs: 10_000,
+      approvalRequiredAboveRows: 2,
+      hardMaxRows: 500,
+    });
+    approval = await startApprovalServer(write, { enabled: true, port: 0 });
+    baseUrl = `http://${approval.host}:${approval.port}`;
+  });
+
+  afterAll(async () => {
+    await approval?.close().catch(() => {});
+    await writerPool?.end().catch(() => {});
+    await withSuperuser(async (c) => {
+      await c.query(`DROP TABLE IF EXISTS ${TABLE} CASCADE`);
+    });
+  });
+
+  it("the handle carries a generated token by default, and the HTML page embeds it for its own Approve/Reject calls", async () => {
+    expect(approval.token).toBeTruthy();
+    expect(typeof approval.token).toBe("string");
+
+    const page = await approvalFetch(approval, `${baseUrl}/`);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    // The page embeds the token so its own fetch() calls can send it via
+    // the Authorization header (see safe-write-mcp-core's renderPage).
+    expect(html).toContain("AUTH_TOKEN");
+  });
+
+  it("a request with no token at all is refused with 401 UNAUTHORIZED, not served", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`);
+    expect(resp.status).toBe(401);
+    const json = (await resp.json()) as { ok: boolean; code: string };
+    expect(json.ok).toBe(false);
+    expect(json.code).toBe("UNAUTHORIZED");
+  });
+
+  it("a request with the wrong token is refused with 401 UNAUTHORIZED", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans`, {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(resp.status).toBe(401);
+    expect(((await resp.json()) as { code: string }).code).toBe("UNAUTHORIZED");
+  });
+
+  it("the ?token= query-string fallback authenticates a human-pasted URL", async () => {
+    const resp = await fetch(`${baseUrl}/api/plans?token=${encodeURIComponent(approval.token!)}`);
+    expect(resp.status).toBe(200);
+  });
+
+  it("an approve POST without a token is refused before touching the plan", async () => {
+    const preview = await write.preview(`DELETE FROM ${TABLE} WHERE id <= 5`, [], {
+      tool: "delete_rows",
+      reason: `auth-no-token-${randomUUID()}`,
+    });
+    expect(preview.status).toBe("awaiting_approval");
+
+    const resp = await fetch(
+      `${baseUrl}/api/plans/${encodeURIComponent(preview.planToken)}/approve`,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+    );
+    expect(resp.status).toBe(401);
+    expect(((await resp.json()) as { code: string }).code).toBe("UNAUTHORIZED");
+
+    // The plan is untouched — still approvable the legitimate way.
+    const list = (await (
+      await approvalFetch(approval, `${baseUrl}/api/plans`)
+    ).json()) as { plans: Array<Record<string, unknown>> };
+    expect(list.plans.find((p) => p.plan_token === preview.planToken)).toBeDefined();
+  });
+
+  it("provenance failures (403) take precedence over auth failures (401)", async () => {
+    // Wrong Origin AND no token: the Host/Origin/Sec-Fetch-Site provenance
+    // check runs first, so this must be 403 FORBIDDEN, not 401.
+    const resp = await fetch(`${baseUrl}/api/plans`, {
+      headers: { Origin: "http://evil.example.com" },
+    });
+    expect(resp.status).toBe(403);
+    expect(((await resp.json()) as { code: string }).code).toBe("FORBIDDEN");
+  });
+});
+
+describe("localhost approval UI: requireAuth: false opts out of bearer auth", () => {
+  let writerPool: pg.Pool;
+  let write: TwoPhaseWrite;
+  let approval: ApprovalServerHandle;
+  let baseUrl: string;
+
+  beforeAll(async () => {
+    await waitForDb(SUPERUSER_URL);
+    writerPool = new pg.Pool({ connectionString: WRITER_URL, max: 1 });
+    write = new TwoPhaseWrite({
+      pool: writerPool,
+      planTtlMs: 60_000,
+      statementTimeoutMs: 10_000,
+    });
+    approval = await startApprovalServer(write, {
+      enabled: true,
+      port: 0,
+      requireAuth: false,
+    });
+    baseUrl = `http://${approval.host}:${approval.port}`;
+  });
+
+  afterAll(async () => {
+    await approval?.close().catch(() => {});
+    await writerPool?.end().catch(() => {});
+  });
+
+  it("the handle token is null and plain fetch() works with no Authorization header", async () => {
+    expect(approval.token).toBeNull();
+
+    const api = await fetch(`${baseUrl}/api/plans`);
+    expect(api.status).toBe(200);
+
+    const page = await fetch(`${baseUrl}/`);
+    expect(page.status).toBe(200);
+  });
+
+  it("an explicit authToken is honoured instead of a generated one", async () => {
+    const writerPool2 = new pg.Pool({ connectionString: WRITER_URL, max: 1 });
+    const write2 = new TwoPhaseWrite({
+      pool: writerPool2,
+      planTtlMs: 60_000,
+      statementTimeoutMs: 10_000,
+    });
+    const approval2 = await startApprovalServer(write2, {
+      enabled: true,
+      port: 0,
+      authToken: "test-fixed-token",
+    });
+    try {
+      expect(approval2.token).toBe("test-fixed-token");
+      const base2 = `http://${approval2.host}:${approval2.port}`;
+
+      const unauth = await fetch(`${base2}/api/plans`);
+      expect(unauth.status).toBe(401);
+
+      const authed = await fetch(`${base2}/api/plans`, {
+        headers: { Authorization: "Bearer test-fixed-token" },
+      });
+      expect(authed.status).toBe(200);
+    } finally {
+      await approval2.close().catch(() => {});
+      await writerPool2.end().catch(() => {});
+    }
   });
 });

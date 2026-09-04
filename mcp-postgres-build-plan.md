@@ -95,17 +95,92 @@ README with architecture diagram and threat model. Publish to npm. Submit to an 
 
 ---
 
-## 5. Demo script (record this exactly)
+## 5. Demo script (record this exactly) — 0.4.0
 
-1. Show the DB: 200k rows, 40k inactive test accounts.
-2. Ask Claude: *"Clean up the test accounts that haven't logged in since 2024."*
-3. Agent calls `delete_rows`. Server previews: **40,112 rows**, above threshold → `awaiting_approval`, with a sample of ten affected rows.
-4. Show the approval UI. **Reject it.** Agent receives the rejection and adapts — narrows to a single test tenant.
-5. Re-preview: 312 rows. Approve. Executes.
-6. Show the audit log: both the rejected plan and the executed one, with the agent's stated reason on each.
-7. Show the hard cap: attempt something over 10,000 rows and get a flat refusal with no approval path offered.
+> This is the 0.4.0 version of the script. Same 4-minute story as 0.3.0, but
+> narrate the 0.4.0 guarantee explicitly — every approval-server route now
+> requires the per-session bearer token — so the recording proves the upgrade
+> rather than hiding it. `safe-write-mcp-core` is now `^0.4.0`
+> (see `src/writeCore.ts`). Open the approval UI at the full URL the server
+> prints once on stderr (`http://127.0.0.1:4319/?token=<token>`); the page's
+> own Approve/Reject buttons already carry the token.
 
-The rejected-then-adapted beat is the whole demo. Anyone can film a happy path.
+1. **Show the DB (20s).** `docker compose up && npm run seed:demo` — 200k rows
+   (50k customers / 2k products / 60k orders / ~96k order_items), 40k inactive
+   customers (`last_login < 2025-01-01`), one 8-customer test tenant fully inside
+   the inactive set. Mention `write.approvalRequiredAboveRows=100`,
+   `write.hardMaxRows=10000`, and `write.journalPath` (env `SW_JOURNAL_PATH`) — the
+   fsync'd JSONL journal that makes the next beat recoverable.
+
+2. **Ask Claude (15s):** *"Clean up the test accounts that haven't logged in
+   since 2024."*
+
+3. **First preview — the gate fires (40s).** Agent calls `delete_rows`
+   (`where: "last_login < $1"`). Server does `BEGIN → DELETE … RETURNING * →`
+   captures exact `affected_rows` + 10 `sample_rows` + `rows_digest` (md5 over
+   `row_to_json` ordered), `ROLLBACK`, then `PlanStore.create(payload, {tool,
+   reason, previewCount: 40112, dataDigest: null, extra:{target,sampleRows,
+   rowsDigest}})` — `dataDigest` stays `null` in 0.3.0 so `beginExecute` doesn't
+   fail closed before the current digest is known; the digest lives in
+   `extra.rowsDigest` for the manual `ROWSET_CHANGED` check. Response:
+   **40,112 rows**, `status:"awaiting_approval"` (threshold is real `ROLLBACK`
+   count, not `EXPLAIN`), with the 10-row sample. Note the journal line
+   (`previewed`→`awaiting_approval`) is fsync'd to `SW_JOURNAL_PATH` if set.
+
+4. **Reject in the localhost UI (40s).** Open the full URL from the server's
+   startup line (`http://127.0.0.1:4319/?token=<token>` — loopback-only,
+   `127.0.0.1` — never `0.0.0.0`; 0.4.0 requires the per-session bearer token
+   on every route, sent as `Authorization: Bearer <token>` or the `?token=`
+   fallback the pasted URL already carries). `GET /api/plans` now returns the host-redacted
+   `render` view (0.3.0 `exposeRawPayload:false` by default; this server opts back
+   in with `exposeRawPayload:true` so `payload` stays visible for the demo). Click
+   **Reject** with reason "too broad". The UI calls `POST /api/plans/:token/reject`
+   → `PlanStore.reject()` writes the tombstone (outlives expiry), emits `rejected`.
+   The agent's blocked `execute_plan` — which did `beginExecute()` → saw
+   `AWAITING_APPROVAL` → `waitForApprovalOutcome()` polling `listPending()` — now
+   re-runs `beginExecute()` and surfaces a structured `PLAN_REJECTED` (core
+   `PLAN_REJECTED` → host `PLAN_REJECTED`) with the human's reason. Show the
+   agent adapting: it narrows to the test tenant (`segment = 'test_tenant'`).
+
+5. **Re-preview → approve → two-step execute (45s).** `delete_rows` with the
+   tenant predicate previews **312 rows** (`previewed`, immediately executable, or
+   still `awaiting_approval` — approve if needed). This time click **Approve**.
+   Call `execute_plan` with the exact `plan_token`/`statement`/`params`. Narrate
+   the 0.3.0 handoff: `beginExecute()` puts the token `executing` (emits
+   `executing`, journal `executing`, `listExecuting()` now shows it); the writer
+   pool runs `BEGIN → DELETE … RETURNING * →` checks `!isInsert && rowsDigest
+   !== stored rowsDigest → ROWSET_CHANGED` (mapped from core
+   `DATA_DIGEST_MISMATCH`), `COMMIT`; only then `confirmExecuted()` marks
+   `executed` and emits `executed`. `ALREADY_EXECUTING` / `NOT_EXECUTING` /
+   `NO_RECONCILE` are the new distinguishable errors if you double-execute.
+
+6. **Show the audit + crash safety (35s).** `SELECT * FROM mcp_audit.log ORDER BY ts`:
+   the rejected plan (`rejected`) and the executed one (`executed`) with the
+   agent's `reason` on each, plus the new `executing` event between
+   `beginExecute` and `confirmExecuted`. Then kill the server mid-execute
+   (`kill -9` or `docker stop` between `beginExecute` and `confirmExecuted`,
+   or just show the `listExecuting()` output) and restart with the same
+   `SW_JOURNAL_PATH`: `PlanStore.fromJournal(path,{reconcile})` replays the
+   journal, `reconcile(token) → "done"|"not-done"|"unknown"` settles each
+   `executing` token, and the UI again shows the recovered state. A lost token
+   store without the journal would require a full re-preview.
+
+7. **Hard-cap wall (15s).** Ask for `orders.status='cancelled'` (≈13,200 rows) →
+   `delete_rows` previews, sees `>hardMaxRows`, audits `hard_cap_refused`,
+   returns `HARD_MAX_ROWS_EXCEEDED` with no `plan_token` and no approval path.
+   Note this is a wall, not a gate — `alwaysRequireApproval` (the `run_migration`
+   path) would have gated, but the hard cap never does.
+
+The rejected-then-adapted beat is still the whole demo. The 0.3.0 additions make
+the safety claim precise on camera: exact `ROLLBACK` counts, `statementFingerprint`
+binding, `ROWSET_CHANGED` (`DATA_DIGEST_MISMATCH`) detection, the `executing`
+handoff that is never causally disconnected from the commit, and a journal that
+survives a crash. The 0.4.0 addition closes the remaining localhost hole on
+camera: loopback binding plus the Host/Origin/Sec-Fetch-Site provenance checks
+stop a hostile browser page, but only the per-session bearer token stops a
+different local process that simply sends the expected headers — show the
+`?token=` URL from the startup line, and note that a token-less `curl` gets
+`401 UNAUTHORIZED`.
 
 ---
 

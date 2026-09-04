@@ -38,6 +38,17 @@ export interface WriteConfig {
    * Default 10_000. Must be >= approvalRequiredAboveRows.
    */
   hardMaxRows: number;
+  /**
+   * Optional path for the append-only, fsync'd transition journal (0.3.0).
+   * When set, every token transition is journaled so a restart can replay
+   * in-flight executions. Env `SW_JOURNAL_PATH` takes precedence.
+   */
+  journalPath?: string;
+  /**
+   * Bounded wait for reconcile callback before treating outcome as "unknown"
+   * (0.3.0). Default 30000 ms. Env `SW_RECONCILE_TIMEOUT_MS` takes precedence.
+   */
+  reconcileTimeoutMs?: number;
 }
 
 export const DEFAULT_WRITE_CONFIG: WriteConfig = {
@@ -65,11 +76,36 @@ export interface ApprovalServerConfig {
    * 4319. Overridable with `SW_APPROVAL_SERVER_PORT`.
    */
   port: number;
+  /**
+   * Whether the localhost approval server requires its per-session bearer
+   * token on every route, including the read-only GET ones (0.4.0,
+   * `safe-write-mcp-core#20`). Default true. Loopback binding plus the
+   * Host/Origin/Sec-Fetch-Site provenance checks stop a hostile browser
+   * page; they do not stop a different local process that simply sends the
+   * expected headers, since a plan token alone was previously enough to
+   * approve or reject a plan — the bearer token is what gates that out.
+   * Set to false only to fall back to the pre-0.4.0 behaviour (not
+   * recommended). Overridable with `SW_APPROVAL_SERVER_REQUIRE_AUTH`
+   * (`"true"`/`"false"`).
+   */
+  requireAuth?: boolean;
+  /**
+   * Explicit bearer token for the localhost approval server, sent as
+   * `Authorization: Bearer <token>` or a `?token=` query-string fallback
+   * (0.4.0). When omitted (the default), the core generates a random
+   * per-session token at startup and `src/index.ts` prints it once alongside
+   * the approval URL — the page's own Approve/Reject buttons already carry
+   * it. Set this when a fixed token is needed (e.g. scripted access);
+   * an empty string is treated as omitted. Overridable with
+   * `SW_APPROVAL_SERVER_AUTH_TOKEN` (env takes precedence over config file).
+   */
+  authToken?: string;
 }
 
 export const DEFAULT_APPROVAL_SERVER_CONFIG: ApprovalServerConfig = {
   enabled: true,
   port: 4319,
+  requireAuth: true,
 };
 
 export interface AppConfig {
@@ -192,6 +228,12 @@ export function loadConfig(configPath?: string): AppConfig {
     );
   };
 
+  const stringOrUndefined = (value: unknown): string | undefined => {
+    if (value === undefined || value === null || value === "") return undefined;
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    throw new Error(`expected a non-empty string, got ${JSON.stringify(value)}`);
+  };
+
   const write: WriteConfig = {
     planTtlMs:
       positiveIntOrThrow(process.env.SW_PLAN_TTL_MS, "planTtlMs") ??
@@ -212,6 +254,14 @@ export function loadConfig(configPath?: string): AppConfig {
       positiveIntOrThrow(process.env.SW_HARD_MAX_ROWS, "hardMaxRows") ??
       positiveIntOrThrow(writeRaw.hardMaxRows, "hardMaxRows") ??
       DEFAULT_WRITE_CONFIG.hardMaxRows,
+    journalPath:
+      stringOrUndefined(process.env.SW_JOURNAL_PATH) ??
+      stringOrUndefined(writeRaw.journalPath) ??
+      undefined,
+    reconcileTimeoutMs:
+      positiveIntOrThrow(process.env.SW_RECONCILE_TIMEOUT_MS, "reconcileTimeoutMs") ??
+      positiveIntOrThrow(writeRaw.reconcileTimeoutMs, "reconcileTimeoutMs") ??
+      undefined,
   };
 
   if (write.hardMaxRows < write.approvalRequiredAboveRows) {
@@ -235,6 +285,22 @@ export function loadConfig(configPath?: string): AppConfig {
       boolOrThrow(approvalServerRaw.enabled, "enabled", "approvalServer") ??
       DEFAULT_APPROVAL_SERVER_CONFIG.enabled,
     port: approvalServerPort,
+    requireAuth:
+      boolOrThrow(
+        process.env.SW_APPROVAL_SERVER_REQUIRE_AUTH,
+        "requireAuth",
+        "approvalServer",
+      ) ??
+      boolOrThrow(approvalServerRaw.requireAuth, "requireAuth", "approvalServer") ??
+      DEFAULT_APPROVAL_SERVER_CONFIG.requireAuth,
+    ...(stringOrUndefined(process.env.SW_APPROVAL_SERVER_AUTH_TOKEN) ??
+    stringOrUndefined(approvalServerRaw.authToken)
+      ? {
+          authToken:
+            stringOrUndefined(process.env.SW_APPROVAL_SERVER_AUTH_TOKEN) ??
+            stringOrUndefined(approvalServerRaw.authToken),
+        }
+      : {}),
   };
 
   // Allowlist supports both nested {read, write} and legacy flat keys for backwards compat

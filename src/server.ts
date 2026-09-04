@@ -211,12 +211,16 @@ export function createServer(
     hardMaxRows: config.write.hardMaxRows,
     callerId: config.callerId,
     approvalAvailable: config.approvalServer?.enabled ?? true,
+    ...(config.write.journalPath ? { journalPath: config.write.journalPath } : {}),
+    ...(config.write.reconcileTimeoutMs !== undefined
+      ? { reconcileTimeoutMs: config.write.reconcileTimeoutMs }
+      : {}),
   }),
 ): Server {
   const server = new Server(
     {
       name: "sw-postgres-mcp",
-      version: "0.3.1",
+      version: "0.4.0",
     },
     {
       capabilities: {

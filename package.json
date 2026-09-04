@@ -1,6 +1,6 @@
 {
   "name": "sw-postgres-mcp",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Safe-write Postgres MCP server with dual-role pools and preview-before-execute",
   "mcpName": "io.github.jpka/sw-postgres-mcp",
   "type": "module",
@@ -44,7 +44,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "pg": "^8.13.0",
-    "safe-write-mcp-core": "^0.1.0",
+    "safe-write-mcp-core": "^0.4.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

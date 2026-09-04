@@ -35,6 +35,10 @@ async function main(): Promise<void> {
     hardMaxRows: config.write.hardMaxRows,
     callerId: config.callerId,
     approvalAvailable: config.approvalServer?.enabled ?? true,
+    ...(config.write.journalPath ? { journalPath: config.write.journalPath } : {}),
+    ...(config.write.reconcileTimeoutMs !== undefined
+      ? { reconcileTimeoutMs: config.write.reconcileTimeoutMs }
+      : {}),
   });
 
   let approvalServer: ApprovalServerHandle | undefined;
@@ -52,12 +56,15 @@ async function main(): Promise<void> {
       throw err;
     }
     console.error(
-      `[sw-postgres-mcp] localhost approval UI listening on http://${approvalServer.host}:${approvalServer.port}`,
+      approvalServer.token !== null
+        ? `[sw-postgres-mcp] localhost approval UI listening on http://${approvalServer.host}:${approvalServer.port}/?token=${approvalServer.token}`
+        : `[sw-postgres-mcp] localhost approval UI listening on http://${approvalServer.host}:${approvalServer.port} (auth disabled: approvalServer.requireAuth is false)`,
     );
   }
 
   const onExit = async () => {
     await approvalServer?.close().catch(() => {});
+    write.close();
     await pools.readonlyPool.end().catch(() => {});
     await pools.writerPool.end().catch(() => {});
     process.exit(0);

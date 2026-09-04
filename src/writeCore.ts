@@ -26,7 +26,10 @@ export type WriteErrorCode =
   | "AWAITING_APPROVAL"
   | "HARD_MAX_ROWS_EXCEEDED"
   | "PLAN_REJECTED"
-  | "APPROVAL_UNAVAILABLE";
+  | "APPROVAL_UNAVAILABLE"
+  | "ALREADY_EXECUTING"
+  | "NOT_EXECUTING"
+  | "NO_RECONCILE";
 
 export class WriteError extends Error {
   readonly code: WriteErrorCode;
@@ -52,8 +55,12 @@ const CODE_MAP: Record<PlanErrorCode, WriteErrorCode> = {
   PLAN_EXPIRED: "EXPIRED_TOKEN",
   PLAN_USED: "USED_TOKEN",
   PLAN_MISMATCH: "STATEMENT_MISMATCH",
+  DATA_DIGEST_MISMATCH: "ROWSET_CHANGED",
   AWAITING_APPROVAL: "AWAITING_APPROVAL",
   PLAN_REJECTED: "PLAN_REJECTED",
+  ALREADY_EXECUTING: "ALREADY_EXECUTING",
+  NOT_EXECUTING: "NOT_EXECUTING",
+  NO_RECONCILE: "NO_RECONCILE",
 };
 
 function mapPlanError(err: PlanError): WriteError {
@@ -125,6 +132,22 @@ export interface TwoPhaseWriteOptions {
   callerId?: string;
   /** Audit sink. Defaults to an `AuditLog` writing through `pool` (the writer role). */
   auditLog?: AuditLog;
+  /**
+   * Optional path for the append-only, fsync'd transition journal (0.3.0).
+   * When set, every token transition is journaled so a restart can replay
+   * in-flight executions via `PlanStore.fromJournal`. See
+   * `safe-write-mcp-core` README for `journalPath` caveats (cleartext JSONL,
+   * `0o600` file). When omitted, no journal is written (zero config).
+   */
+  journalPath?: string;
+  /**
+   * Host-supplied reconcile hook for journal recovery (0.3.0).
+   * Answers "did the external side effect actually happen?" for a token left
+   * `executing` on restart. See `ReconcileCallback` in `safe-write-mcp-core`.
+   */
+  reconcile?: (planToken: string) => Promise<"done" | "not-done" | "unknown"> | "done" | "not-done" | "unknown";
+  /** Bounded wait for reconcile callback before treating outcome as "unknown". Default 30000 ms. */
+  reconcileTimeoutMs?: number;
 }
 
 const DEFAULT_APPROVAL_REQUIRED_ABOVE_ROWS = 100;
@@ -236,6 +259,9 @@ export class TwoPhaseWrite {
     this.store = new PostgresPlanStore({
       planTtlMs: opts.planTtlMs,
       audit: NoopSink,
+      ...(opts.journalPath ? { journalPath: opts.journalPath } : {}),
+      ...(opts.reconcile ? { reconcile: opts.reconcile } : {}),
+      ...(opts.reconcileTimeoutMs !== undefined ? { reconcileTimeoutMs: opts.reconcileTimeoutMs } : {}),
     });
     this.auditLog = opts.auditLog ?? new AuditLog(opts.pool);
     this.callerId = opts.callerId ?? "unknown";
@@ -348,13 +374,17 @@ export class TwoPhaseWrite {
         reason,
         callerId: this.callerId,
         previewCount: affectedRows,
-        // Kept verbatim (including '' for an empty row set): execute()
-        // re-compares it, and an empty preview digest must still trip
-        // ROWSET_CHANGED if rows enter the predicate before execution.
-        dataDigest: rowsDigest,
+        // 0.3.0: keep core `dataDigest` null so `beginExecute()` does not
+        // fail closed with `DATA_DIGEST_MISMATCH` before we have a chance to
+        // compute the current digest inside `execute()`'s transaction. The
+        // digest is still stored in `extra` for the manual `ROWSET_CHANGED`
+        // check that `execute()` performs post-execution (see `execute()`
+        // and DECISIONS.md). An empty digest ('' for an empty row set or DDL)
+        // is still significant and must trip ROWSET_CHANGED if rows appear.
+        dataDigest: null,
         approvalRequired: affectedRows > this.approvalRequiredAboveRows,
         alwaysRequireApproval: meta.alwaysRequireApproval,
-        extra: { target, sampleRows },
+        extra: { target, sampleRows, rowsDigest },
       });
 
       // Recorded on the same connection, after ROLLBACK has ended the preview
@@ -429,30 +459,30 @@ export class TwoPhaseWrite {
     // A gated plan still awaiting human approval blocks this call until a
     // human approves, rejects, or the plan expires, so the out-of-band
     // decision surfaces here on the in-flight call instead of requiring the
-    // agent to re-call execute_plan later. The core's consume() deliberately
-    // does not mark a token used on an AWAITING_APPROVAL refusal, so
-    // re-consuming after the wait is safe. Any other consume() outcome is
-    // final (a success already marks the token used), so it is only ever
-    // re-consumed through the awaiting-approval branch.
-    let consumed = this.store.consume(planToken, payload);
-    if (!consumed.ok && consumed.error.code === "AWAITING_APPROVAL") {
+    // agent to re-call execute_plan later. `beginExecute()` deliberately
+    // does not mark a token used on an `AWAITING_APPROVAL` refusal (it never
+    // enters `executing`), so re-trying after the wait is safe. Any other
+    // `beginExecute()` outcome is final, so it is only ever re-tried through
+    // the awaiting-approval branch.
+    let begun = this.store.beginExecute(planToken, payload);
+    if (!begun.ok && begun.error.code === "AWAITING_APPROVAL") {
       await this.waitForApprovalOutcome(planToken);
-      consumed = this.store.consume(planToken, payload);
+      begun = this.store.beginExecute(planToken, payload);
     }
     // A token that never existed (or expired before this call) has no stored
     // meta to recover — fall back to generic attribution so the attempt is
     // still audited rather than dropped.
-    const meta = consumed.meta
+    const meta = begun.meta
       ? {
-          tool: consumed.meta.tool,
-          reason: consumed.meta.reason,
-          callerId: consumed.meta.callerId,
-          previewRows: consumed.meta.previewCount ?? NaN,
+          tool: begun.meta.tool,
+          reason: begun.meta.reason,
+          callerId: begun.meta.callerId,
+          previewRows: begun.meta.previewCount ?? NaN,
         }
       : { tool: "execute_plan", reason: null, callerId: this.callerId, previewRows: NaN };
     const previewRows = Number.isNaN(meta.previewRows) ? null : meta.previewRows;
 
-    if (!consumed.ok) {
+    if (!begun.ok) {
       await this.auditLog.record({
         tool: meta.tool,
         reason: meta.reason,
@@ -466,10 +496,21 @@ export class TwoPhaseWrite {
         durationMs: Date.now() - startedAt,
         callerId: meta.callerId,
       });
-      throw mapPlanError(consumed.error);
+      throw mapPlanError(begun.error);
     }
 
-    const dataDigest = consumed.meta.dataDigest;
+    // 0.3.0: preview stored the digest in `extra.rowsDigest` with
+    // `dataDigest: null` so `beginExecute()` does not enforce it before we
+    // have a current digest. Retrieve it for the manual ROWSET_CHANGED check
+    // post-execution. The core's own `DATA_DIGEST_MISMATCH` would only fire
+    // if a future preview opts back into `dataDigest` enforcement.
+    const storedDigest =
+      begun.meta.extra !== null &&
+      typeof begun.meta.extra === "object" &&
+      "rowsDigest" in (begun.meta.extra as Record<string, unknown>)
+        ? ((begun.meta.extra as Record<string, unknown>).rowsDigest as string | null)
+        : null;
+    const dataDigest = storedDigest;
     const client = await this.opts.pool.connect();
     try {
       await client.query(`SET statement_timeout = ${this.opts.statementTimeoutMs}`);
@@ -510,6 +551,11 @@ export class TwoPhaseWrite {
         // params) already guarantees execute() replays the identical INSERT
         // the agent previewed, which is the only guarantee that applies here.
         if (!isInsertStatement(statement) && dataDigest !== null && row.rows_digest !== dataDigest) {
+          await client.query("ROLLBACK").catch(() => {});
+          // 0.3.0 two-step: release the token back to retryable so the agent
+          // can re-preview rather than leaving it stuck `executing`. The digest
+          // mismatch is a definitive "did not commit" outcome.
+          this.store.confirmFailed(planToken);
           throw new WriteError(
             "ROWSET_CHANGED",
             "The set of rows the statement would affect changed since the preview.",
@@ -519,6 +565,11 @@ export class TwoPhaseWrite {
         affectedRows = Number(row.affected_rows);
       }
       await client.query("COMMIT");
+      // 0.3.0 two-step: only now — after the external side effect definitely
+      // committed — do we mark the plan `executed` and emit the `executed`
+      // audit event. This keeps the audit record causally connected to a side
+      // effect that really happened.
+      this.store.confirmExecuted(planToken);
 
       // Recorded after COMMIT, on the same connection (now back to
       // autocommit), so a failure to write the audit row can never roll back
@@ -542,7 +593,19 @@ export class TwoPhaseWrite {
 
       return { affectedRows };
     } catch (err) {
+      // A WriteError thrown for ROWSET_CHANGED above already did its own
+      // ROLLBACK + confirmFailed, so a second ROLLBACK here is a harmless
+      // no-op and a second confirmFailed will be NOT_EXECUTING.
       await client.query("ROLLBACK").catch(() => {});
+      // Ensure a token left `executing` is released back to retryable on a
+      // definitive failure. If the token was already settled (confirmExecuted
+      // succeeded or ROWSET_CHANGED already called confirmFailed), this is a
+      // no-op (`NOT_EXECUTING`) and must not mask the original error.
+      if (err instanceof WriteError && err.code === "ROWSET_CHANGED") {
+        // already handled before throw — don't double-settle
+      } else {
+        this.store.confirmFailed(planToken);
+      }
       const translated = translateDbError(err);
       await this.auditLog.record(
         {
@@ -729,7 +792,7 @@ export class TwoPhaseWrite {
    * `PlanStore.listPending()` — the public, canonical "still awaiting a human
    * decision" view — on a 100 ms interval. Bounded by the plan TTL plus a small
    * grace period so an unchosen plan can never hold the call open forever;
-   * once the wait ends, the subsequent consume() reports the final state
+   * once the wait ends, the subsequent `beginExecute()` reports the final state
    * (approved → executes, rejected → PLAN_REJECTED, expired → EXPIRED_TOKEN).
    */
   private async waitForApprovalOutcome(planToken: string): Promise<void> {
@@ -744,6 +807,11 @@ export class TwoPhaseWrite {
       if (!stillPending) return;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+  }
+
+  /** Closes the underlying journal file (if configured). Transitions after this are no longer journaled. */
+  close(): void {
+    this.store.close();
   }
 
   private previewSql(statement: string): string {
@@ -846,8 +914,8 @@ function translateDbError(err: unknown): unknown {
 /**
  * Fingerprint of a statement plus its parameter values, via the core's
  * canonical-JSON fingerprint. Exported for tests and tooling; the plan
- * binding itself is enforced inside PlanStore.create()/consume() on the
- * identical payload shape.
+ * binding itself is enforced inside PlanStore.create()/beginExecute()
+ * (and its legacy `consume()` wrapper) on the identical payload shape.
  */
 export function statementFingerprint(
   statement: string,

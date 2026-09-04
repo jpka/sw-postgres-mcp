@@ -5,6 +5,64 @@ were, what we picked, and the reasoning a reviewer can check. Newest first.
 
 ---
 
+## 2026-09-04 — Consuming safe-write-mcp-core 0.4.0: bearer-token auth on the localhost approval server
+
+**Ticket:** update this project to work with version 0.4.0 of `safe-write-mcp-core`.
+The only host-visible change in 0.4.0 is the approval server's per-session bearer
+token (`safe-write-mcp-core#20`): every route — including the read-only GET ones —
+now requires `Authorization: Bearer <token>` or a `?token=` query-string fallback,
+returning `401 UNAUTHORIZED` without it. (The 0.4.0 package also deletes the stale
+`dist/replay.js`, which this project's `dist/index.js` never imported — `index`
+already re-exported `replayJournal` from `./journal.js` in 0.3.0 — so there is
+nothing to migrate there. `PlanStore`, the journal, and the error codes are
+unchanged.)
+
+### Why the token matters, given the existing provenance checks
+
+The localhost server already binds to `127.0.0.1` and checks Host/Origin/
+Sec-Fetch-Site (see the #7 entry below). Those stop a hostile *browser page*
+(CSRF / DNS rebinding). They do not stop a *different local process* — curl,
+another daemon, a second agent harness on the same machine — that simply sends
+the expected headers, since a plan token alone was previously enough to approve
+or reject a plan. The bearer token is what gates "another local process" out:
+it is generated per startup, never leaves the machine (printed once on stderr
+alongside the URL), and the built-in page embeds it for its own Approve/Reject
+fetch calls. This is defense in depth on a surface that calls `approve()`/
+`reject()` directly — the one surface the agent must never reach — so the
+default here follows the core: auth on unless explicitly opted out.
+
+### What changed on this side
+
+- `src/config.ts`: `ApprovalServerConfig` gains `requireAuth` (default `true`,
+  env `SW_APPROVAL_SERVER_REQUIRE_AUTH`) and `authToken` (env
+  `SW_APPROVAL_SERVER_AUTH_TOKEN`, file-or-env, empty treated as omitted).
+  Explicit opt-out rather than silent default: `requireAuth: false` falls back
+  to the pre-0.4.0 behaviour, and the startup log says so.
+- `src/approvalServer.ts`: both `createApprovalServer` and
+  `startApprovalServer` forward `authToken`/`requireAuth` verbatim to the core
+  (a new optional second parameter on the former, so existing direct callers
+  keep working and get the core's secure default). No logic of its own — the
+  token generation, the `401`/`403` ordering (provenance first, then auth), and
+  the page embedding all stay in the core.
+- `src/index.ts`: the startup line now prints the full
+  `http://127.0.0.1:<port>/?token=<token>` URL when auth is on, so a human can
+  paste it and authenticate on first load; when `requireAuth: false` it prints
+  the plain URL and says auth is disabled.
+- Tests: `tests/approvalUi.test.ts` / `tests/runMigration.test.ts` carry the
+  handle's token on every request via an `approvalFetch` helper (degrading to
+  plain fetch when `token` is null); a new block asserts the gate itself —
+  missing/wrong token → `401 UNAUTHORIZED`, `?token=` fallback works, `403`
+  provenance failures precede `401`, `requireAuth: false` yields a null token
+  and serves plain fetch, and an explicit `authToken` is honoured.
+  `tests/config.test.ts` covers the two new settings and env precedence.
+
+An alternative not taken: pinning a fixed token in `config.example.json`. A
+committed example token would be copied into real deployments unchanged, which
+is worse than a per-startup random one nobody has to manage — the example sets
+only `requireAuth: true` and leaves `authToken` unset.
+
+---
+
 ## 2026-08-14 — execute_plan blocks while a plan awaits approval: the rejection (or approval) surfaces on the in-flight call
 
 The reported bug: a human clicking "Reject" in the localhost approval UI killed the token server-side (store tombstone, `rejected` audit row, `PLAN_REJECTED` on the next consume), but nothing surfaced to the agent in Claude Desktop. After a preview returned `status: "awaiting_approval"`, the tool message told the agent to "wait for approval", so the agent's turn ended and it idled; there is no push channel over MCP stdio, so the agent only learned of a rejection if it happened to re-call `execute_plan` on its own — which the "wait" guidance gave it no reason to do.

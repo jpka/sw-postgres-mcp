@@ -263,3 +263,54 @@ describe("approval threshold / hard cap config (ticket #6)", () => {
     expect(config.write.hardMaxRows).toBe(100);
   });
 });
+
+describe("approval server auth config (0.4.0)", () => {
+  it("defaults requireAuth to true with no authToken", () => {
+    const config = loadConfig(writeTempConfig({}));
+    expect(config.approvalServer.requireAuth).toBe(true);
+    expect(config.approvalServer.authToken).toBeUndefined();
+  });
+
+  it("accepts requireAuth/authToken overrides from the config file", () => {
+    const config = loadConfig(
+      writeTempConfig({
+        approvalServer: { requireAuth: false, authToken: "file-token" },
+      }),
+    );
+    expect(config.approvalServer.requireAuth).toBe(false);
+    expect(config.approvalServer.authToken).toBe("file-token");
+  });
+
+  it("accepts requireAuth/authToken from environment overrides, env taking precedence", () => {
+    const prevRo = process.env.DATABASE_URL_READONLY;
+    const prevWr = process.env.DATABASE_URL_WRITER;
+    const prevRequire = process.env.SW_APPROVAL_SERVER_REQUIRE_AUTH;
+    const prevToken = process.env.SW_APPROVAL_SERVER_AUTH_TOKEN;
+    try {
+      process.env.DATABASE_URL_READONLY = "postgres://ro:ro@localhost/db";
+      process.env.DATABASE_URL_WRITER = "postgres://rw:rw@localhost/db";
+      process.env.SW_APPROVAL_SERVER_REQUIRE_AUTH = "false";
+      process.env.SW_APPROVAL_SERVER_AUTH_TOKEN = "env-token";
+      const config = loadConfig(
+        writeTempConfig({ approvalServer: { requireAuth: true } }),
+      );
+      expect(config.approvalServer.requireAuth).toBe(false);
+      expect(config.approvalServer.authToken).toBe("env-token");
+    } finally {
+      if (prevRequire === undefined) delete process.env.SW_APPROVAL_SERVER_REQUIRE_AUTH;
+      else process.env.SW_APPROVAL_SERVER_REQUIRE_AUTH = prevRequire;
+      if (prevToken === undefined) delete process.env.SW_APPROVAL_SERVER_AUTH_TOKEN;
+      else process.env.SW_APPROVAL_SERVER_AUTH_TOKEN = prevToken;
+      if (prevRo === undefined) delete process.env.DATABASE_URL_READONLY;
+      else process.env.DATABASE_URL_READONLY = prevRo;
+      if (prevWr === undefined) delete process.env.DATABASE_URL_WRITER;
+      else process.env.DATABASE_URL_WRITER = prevWr;
+    }
+  });
+
+  it("rejects non-boolean requireAuth values", () => {
+    expect(() =>
+      loadConfig(writeTempConfig({ approvalServer: { requireAuth: "yes" } })),
+    ).toThrow(/requireAuth/);
+  });
+});

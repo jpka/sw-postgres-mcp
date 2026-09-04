@@ -75,6 +75,27 @@ async function auditRowsForReason(reason: string): Promise<Record<string, unknow
   });
 }
 
+/**
+ * 0.4.0: every approval-server route requires the per-session bearer token
+ * (`Authorization: Bearer <token>`, or a `?token=` query-string fallback).
+ * This helper carries it on every request so the tests below exercise the
+ * migration behavior itself. When auth is disabled (`requireAuth: false`,
+ * `token: null`) it degrades to plain fetch.
+ */
+function approvalFetch(
+  approval: ApprovalServerHandle,
+  url: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const token = approval.token;
+  if (token === null) return fetch(url, init);
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Authorization") && !url.includes("token=")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  return fetch(url, { ...init, headers });
+}
+
 describe("parseDdlStatement — DDL target extraction (#9)", () => {
   it("extracts CREATE TABLE's target, defaulting to public when unqualified", () => {
     expect(parseDdlStatement("CREATE TABLE customers (id serial primary key)")).toEqual({
@@ -266,7 +287,7 @@ describe("run_migration (#9)", () => {
     expect(await tableExists(table)).toBe(false);
 
     // Approve through the real HTTP endpoint — not TwoPhaseWrite called directly.
-    const approveResp = await fetch(
+    const approveResp = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`,
       {
         method: "POST",
@@ -312,7 +333,7 @@ describe("run_migration (#9)", () => {
     const { body } = parseToolResult(preview as never);
     expect(body.status).toBe("awaiting_approval");
 
-    const resp = await fetch(`${baseUrl}/api/plans`);
+    const resp = await approvalFetch(approval, `${baseUrl}/api/plans`);
     const { plans } = (await resp.json()) as { plans: Array<Record<string, unknown>> };
     const mine = plans.find((p) => p.plan_token === body.plan_token);
     expect(mine).toBeDefined();
@@ -326,7 +347,7 @@ describe("run_migration (#9)", () => {
     expect(mine!.reason).toBe(reason);
     expect(mine!.tool).toBe("run_migration");
 
-    const pageResp = await fetch(`${baseUrl}/`);
+    const pageResp = await approvalFetch(approval, `${baseUrl}/`);
     const html = await pageResp.text();
     expect(html).toContain(reason);
     expect(html).toContain(`public.${table}`);
@@ -345,7 +366,7 @@ describe("run_migration (#9)", () => {
     const { body } = parseToolResult(preview as never);
     expect(body.status).toBe("awaiting_approval");
 
-    const rejectResp = await fetch(
+    const rejectResp = await approvalFetch(approval,
       `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/reject`,
       {
         method: "POST",
@@ -494,7 +515,7 @@ describe("run_migration (#9)", () => {
     // transactional, so the column must not exist yet.
     expect(await columnExists(table, "active")).toBe(false);
 
-    await fetch(`${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`, {
+    await approvalFetch(approval, `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
@@ -524,7 +545,7 @@ describe("run_migration (#9)", () => {
     // Rolled back — the table must still be there after the preview.
     expect(await tableExists(table)).toBe(true);
 
-    await fetch(`${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`, {
+    await approvalFetch(approval, `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
@@ -556,7 +577,7 @@ describe("run_migration (#9)", () => {
     expect(body.target).toBe(`public.${table}`);
     expect(await indexExists(indexName)).toBe(false);
 
-    await fetch(`${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`, {
+    await approvalFetch(approval, `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
@@ -581,7 +602,7 @@ describe("run_migration (#9)", () => {
     });
     const { body } = parseToolResult(preview as never);
 
-    await fetch(`${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`, {
+    await approvalFetch(approval, `${baseUrl}/api/plans/${encodeURIComponent(body.plan_token as string)}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
